@@ -20,10 +20,26 @@
         }
     },
     "scripts": {
-        "start": "@php -S localhost:8080 index.php",
-        "test": "phpunit",
-        "test:unit": "phpunit --testsuite Unit",
-        "test:integration": "phpunit --testsuite Integration"
+        "start":               "@php -S localhost:8080 index.php",
+
+        "test":                "phpunit",
+        "test:unit":           "phpunit --testsuite Unit",
+        "test:integration":    "phpunit --testsuite Integration",
+
+        "coverage":            "phpunit --coverage-text=coverage/coverage.txt",
+        "coverage:unit":       "phpunit --testsuite Unit   --coverage-text=coverage/coverage.txt",
+        "coverage:integration":"phpunit --testsuite Integration --coverage-text=coverage/coverage.txt",
+        "coverage:ci":         "phpunit --log-junit coverage/junit.xml --coverage-text=coverage/coverage.txt"
+    },
+    "scripts-descriptions": {
+        "start":               "Start the built-in PHP development server on :8080",
+        "test":                "Run the full test suite (no coverage)",
+        "test:unit":           "Run only the Unit testsuite (fast, no server)",
+        "test:integration":    "Run only the Integration testsuite (starts a real PHP server)",
+        "coverage":            "Run full suite WITH coverage — requires Xdebug (XDEBUG_MODE=coverage) or PCOV",
+        "coverage:unit":       "Coverage for Unit tests only",
+        "coverage:integration":"Coverage for Integration tests only",
+        "coverage:ci":         "CI mode: coverage reports + JUnit XML in coverage/"
     },
     "config": {
         "process-timeout": 0

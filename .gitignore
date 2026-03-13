@@ -8,8 +8,10 @@ data/*
 # Composer dependencies
 vendor/
 
-# PHPUnit
+# PHPUnit / coverage artefacts
 .phpunit.result.cache
 coverage/
 
 *.log
+.python-version
+.idea/

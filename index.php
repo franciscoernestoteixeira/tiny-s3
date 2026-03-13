@@ -649,7 +649,12 @@ function deleteObject(string $bucketDir, string $key, string $bucket): void
 // ================================================================================================
 // SECTION 10 — ENTRY POINT
 // Bootstrap, exception handler, signature check, URL parsing, method dispatch.
+//
+// Guarded by TINY_S3_TEST so that PHPUnit can require this file to register all
+// function definitions (and measure coverage) without triggering the HTTP bootstrap.
 // ================================================================================================
+
+if (!defined('TINY_S3_TEST')) {
 
 ini_set('display_errors', '1');
 error_reporting(E_ALL);
@@ -728,3 +733,5 @@ match ($method) {
     'DELETE' => handleDelete($bucket, $key, $bucketDir),
     default  => sendError(405, 'MethodNotAllowed', "HTTP method '$method' is not supported"),
 };
+
+} // end if (!defined('TINY_S3_TEST'))

@@ -14,10 +14,53 @@
         </testsuite>
     </testsuites>
 
+    <!--
+        Source files to measure coverage against.
+        PHPUnit will report uncovered lines in index.php even if no test hits them.
+    -->
     <source>
         <include>
             <file>index.php</file>
         </include>
     </source>
+
+    <!--
+        Coverage reports — generated when the coverage driver is active.
+
+        Driver requirements (pick one):
+          • Xdebug  ≥ 3  →  set  XDEBUG_MODE=coverage  before running PHPUnit
+                            or add  -d xdebug.mode=coverage  to the PHP CLI call
+          • PCOV        →  php -d extension=pcov.so  (Linux/macOS)
+
+        Output directory layout:
+          coverage/
+            html/          ← rich interactive HTML (open index.html in a browser / Jenkins)
+            clover.xml     ← Clover XML  (Jenkins Clover PHP Plugin)
+            cobertura.xml  ← Cobertura XML (Jenkins Cobertura Plugin)
+            coverage.txt   ← plain-text summary printed to stdout / archived as artefact
+    -->
+    <coverage>
+        <report>
+            <!-- HTML report: line + branch + path coverage, colour-coded per function -->
+            <html
+                outputDirectory="coverage/html"
+                lowUpperBound="50"
+                highLowerBound="90"
+            />
+
+            <!-- Clover XML: consumed by the Jenkins "Clover PHP" plugin -->
+            <clover outputFile="coverage/clover.xml"/>
+
+            <!-- Cobertura XML: consumed by the Jenkins "Cobertura" plugin -->
+            <cobertura outputFile="coverage/cobertura.xml"/>
+
+            <!-- Plain-text summary: streamed to the build log and saved as an artefact -->
+            <text
+                outputFile="coverage/coverage.txt"
+                showUncoveredFiles="true"
+                showOnlySummary="false"
+            />
+        </report>
+    </coverage>
 
 </phpunit>
