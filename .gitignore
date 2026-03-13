@@ -1,2 +1,15 @@
+# Runtime secrets — never commit
 .env
+
+# Storage data — content only, preserve the directory
 data/*
+!data/.gitkeep
+
+# Composer dependencies
+vendor/
+
+# PHPUnit
+.phpunit.result.cache
+coverage/
+
+*.log

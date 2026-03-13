@@ -122,18 +122,21 @@ Each **bucket** is a directory. Each **object key** maps directly to a file path
 
 ```bash
 # 1. Clone or copy index.php to your web root
-git clone https://github.com/you/tiny-s3.git /var/www/tiny-s3
+git clone https://github.com/franciscoteixeira/tiny-s3.git /var/www/tiny-s3
 cd /var/www/tiny-s3
 
-# 2. Create your .env file from the template
+# 2. Install dev dependencies (PHPUnit + Guzzle — skip if you don't need tests)
+composer install
+
+# 3. Create your .env file from the template
 cp .env.template .env
 nano .env   # fill in ACCESS_KEY, SECRET_KEY, etc.
 
-# 3. Create the storage directory (parent of STORAGE_ROOT)
+# 4. Create the storage directory (parent of STORAGE_ROOT)
 mkdir -p /var/www/data
 chown www-data:www-data /var/www/data
 
-# 4. Make the log file writable if you enable DEBUG
+# 5. Make the log file writable if you enable DEBUG
 touch activities.log
 chown www-data:www-data activities.log
 ```
@@ -161,6 +164,13 @@ location ~ \.php$ {
 ```
 
 ### PHP built-in server (development only)
+
+```bash
+composer start
+```
+
+This runs `php -S localhost:8080 index.php`. To bind to all interfaces instead
+(e.g. to reach the server from another machine on the same network):
 
 ```bash
 php -S 0.0.0.0:8080 index.php
@@ -242,6 +252,86 @@ rclone copy file.txt tinys3:my-bucket/
 
 ---
 
+## Testing
+
+There are two complementary ways to test Tiny S3.
+
+### PHPUnit (automated, CI-friendly)
+
+A full PHPUnit suite lives in `tests/`. It requires PHP 8.1+, [Composer](https://getcomposer.org),
+and nothing else — the integration suite starts its own PHP built-in server automatically.
+
+```bash
+# Install dependencies (first time only)
+composer install
+
+# Run the full suite
+composer test
+
+# Run only the fast unit tests (no server required)
+composer test:unit
+
+# Run only the integration tests
+composer test:integration
+```
+
+**Suite structure**
+
+```
+tests/
+├── bootstrap.php               # Composer autoload + helpers.php
+├── helpers.php                 # Pure function stubs from index.php (no exit/header calls)
+├── Unit/
+│   ├── EnvTest.php             # loadEnv(), envToBool()
+│   ├── XmlTest.php             # xmlElement()
+│   ├── AuthParserTest.php      # parseAuthorization()
+│   ├── SigningKeyTest.php      # getSigningKey() — AWS test vectors
+│   └── FileSystemTest.php      # listObjectsRecursively(), deleteDirectoryRecursive()
+└── Integration/
+    ├── SigV4Signer.php         # PHP port of the HMAC signing chain
+    └── S3ServerTest.php        # 17 HTTP tests via Guzzle against a live server
+```
+
+The split exists because `index.php` is a single-file script — the entry point runs
+immediately on `require` and eventually calls `exit()`. Unit tests include `helpers.php`,
+which extracts every pure function from the server. Integration tests start a real
+`php -S` child process and fire actual HTTP requests, signed with the same Signature V4
+chain used by `test.sh` and `test.ps1`.
+
+Both suites exit with code `0` on full pass and `1` on any failure.
+
+---
+
+### Bash / PowerShell validators
+
+Quick smoke-tests that need only a running server — no Composer, no PHPUnit. Both
+implement AWS Signature V4 signing from scratch and run the same 7-step sequence:
+create bucket → upload → head → list → download & verify → delete object → delete bucket.
+
+#### Bash (Linux / macOS)
+
+Requires `bash`, `curl`, and `openssl`.
+
+```bash
+chmod +x test.sh
+./test.sh
+
+# Override any value inline
+ENDPOINT=http://192.168.1.10:8080 ACCESS_KEY=mykey SECRET_KEY=mysecret ./test.sh
+```
+
+#### PowerShell (Windows / cross-platform)
+
+Requires PowerShell 5.1+ (Windows) or PowerShell 7+ (cross-platform).  
+Uses only built-in `System.Security.Cryptography` — no extra modules needed.
+
+```powershell
+.\test.ps1
+.\test.ps1 -Endpoint http://192.168.1.10:8080 -AccessKey mykey -SecretKey mysecret
+```
+
+---
+
 ## Security Notes
 
 - **Path traversal protection** — all GET and DELETE operations resolve the object key with `realpath()` and verify the result stays inside the bucket directory before any file access or deletion.
@@ -269,4 +359,4 @@ This is intentionally minimal. The following S3 features are **not** supported:
 
 ## License
 
-MIT
+MIT — Copyright © 2026 Francisco Ernesto Teixeira

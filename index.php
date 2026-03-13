@@ -94,7 +94,7 @@ function envToBool(string $value): bool
  * @param 'ERROR'|'WARN'|'INFO'|'DEBUG' $level   Severity level
  * @param string                         $message Log message text
  */
-function log(string $level, string $message): void
+function writeLog(string $level, string $message): void
 {
     global $debug, $logFile;
 
@@ -142,7 +142,7 @@ function sendError(int $httpCode, string $code, string $message): never
     http_response_code($httpCode);
     header('Content-Type: application/xml');
     echo "<e>" . xmlElement('Code', $code) . xmlElement('Message', $message) . "</e>";
-    log('ERROR', "HTTP $httpCode [$code] $message");
+    writeLog('ERROR', "HTTP $httpCode [$code] $message");
     exit;
 }
 
@@ -200,21 +200,21 @@ function getSigningKey(string $date, string $region, string $service): string
 function checkSignature(): void
 {
     $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-    log('DEBUG', "Authorization header: $authHeader");
+    writeLog('DEBUG', "Authorization header: $authHeader");
 
     $auth = parseAuthorization($authHeader);
-    log('DEBUG', "Parsed auth: " . json_encode($auth));
+    writeLog('DEBUG', "Parsed auth: " . json_encode($auth));
 
     // --- 1. Access key check ---
     if ($auth['AK'] !== $GLOBALS['accessKey']) {
-        log('ERROR', "Access key mismatch — received '{$auth['AK']}'");
+        writeLog('ERROR', "Access key mismatch — received '{$auth['AK']}'");
         sendError(403, 'AccessDenied', 'Invalid Access Key');
     }
 
     // --- 2. Require x-amz-date header ---
     $amzDate = $_SERVER['HTTP_X_AMZ_DATE'] ?? '';
     if (!$amzDate) {
-        log('ERROR', "Missing x-amz-date header");
+        writeLog('ERROR', "Missing x-amz-date header");
         sendError(403, 'MissingDate', 'x-amz-date header is required');
     }
 
@@ -261,7 +261,7 @@ function checkSignature(): void
         $auth['Signed']       . "\n" .
         $hashedPayload;
 
-    log('DEBUG', "Canonical request:\n$canonicalRequest");
+    writeLog('DEBUG', "Canonical request:\n$canonicalRequest");
 
     // --- 4. Build string-to-sign ---
     $region = $GLOBALS['region'];
@@ -272,20 +272,20 @@ function checkSignature(): void
         $auth['Date'] . "/$region/s3/aws4_request\n" .
         hash('sha256', $canonicalRequest);
 
-    log('DEBUG', "String-to-sign:\n$stringToSign");
+    writeLog('DEBUG', "String-to-sign:\n$stringToSign");
 
     // --- 5. Derive signing key and compare using timing-safe comparison ---
     $signingKey    = getSigningKey($auth['Date'], $region, 's3');
     $calculatedSig = hash_hmac('sha256', $stringToSign, $signingKey);
 
-    log('DEBUG', "Signature — calculated: $calculatedSig | received: {$auth['Sig']}");
+    writeLog('DEBUG', "Signature — calculated: $calculatedSig | received: {$auth['Sig']}");
 
     if (!hash_equals($calculatedSig, $auth['Sig'])) {
-        log('ERROR', "Signature mismatch — calculated: $calculatedSig | received: {$auth['Sig']}");
+        writeLog('ERROR', "Signature mismatch — calculated: $calculatedSig | received: {$auth['Sig']}");
         sendError(403, 'SignatureDoesNotMatch', 'The request signature does not match');
     }
 
-    log('DEBUG', "Signature OK");
+    writeLog('DEBUG', "Signature OK");
 }
 
 
@@ -318,7 +318,7 @@ function resolveSafePath(string $bucketDir, string $key): string
     }
 
     if ($resolvedBucket === false || !str_starts_with($resolvedPath, $resolvedBucket . DIRECTORY_SEPARATOR)) {
-        log('ERROR', "Path traversal attempt — key: '$key' | resolved: '$resolvedPath' | bucket: '$resolvedBucket'");
+        writeLog('ERROR', "Path traversal attempt — key: '$key' | resolved: '$resolvedPath' | bucket: '$resolvedBucket'");
         sendError(403, 'AccessDenied', 'Path traversal is not permitted');
     }
 
@@ -353,14 +353,14 @@ function createBucket(string $bucketDir, string $bucket): void
     }
 
     if (!mkdir($bucketDir, 0755, true)) {
-        log('ERROR', "mkdir failed for bucket directory: $bucketDir");
+        writeLog('ERROR', "mkdir failed for bucket directory: $bucketDir");
         sendError(500, 'InternalError', 'Could not create bucket directory');
     }
 
     http_response_code(200);
     header('Content-Type: application/xml');
     echo "<CreateBucketResult>" . xmlElement('Location', "/$bucket") . "</CreateBucketResult>";
-    log('INFO', "Bucket created: $bucket");
+    writeLog('INFO', "Bucket created: $bucket");
 }
 
 /**
@@ -387,7 +387,7 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
     $in        = fopen('php://input', 'r');
     $isChunked = ($_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '') === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER';
 
-    log('INFO', "Upload started — mode: " . ($isChunked ? 'aws-chunked' : 'normal') . " | path: $fullPath");
+    writeLog('INFO', "Upload started — mode: " . ($isChunked ? 'aws-chunked' : 'normal') . " | path: $fullPath");
 
     if ($isChunked) {
         while (true) {
@@ -402,7 +402,7 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
             $sizeHex = $semiPos !== false ? substr($chunkHeader, 0, $semiPos) : $chunkHeader;
 
             if (!ctype_xdigit($sizeHex)) {
-                log('WARN', "Unrecognised chunk header: '$chunkHeader' — aborting upload of $bucket/$key");
+                writeLog('WARN', "Unrecognised chunk header: '$chunkHeader' — aborting upload of $bucket/$key");
                 break;
             }
 
@@ -413,7 +413,7 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
                 while (($line = fgets($in)) !== false && trim($line) !== '') {
                     // consume trailer lines
                 }
-                log('DEBUG', "Terminal chunk (size=0) received — $bucket/$key");
+                writeLog('DEBUG', "Terminal chunk (size=0) received — $bucket/$key");
                 break;
             }
 
@@ -421,7 +421,7 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
             while ($remaining > 0) {
                 $chunk = fread($in, min(8192, $remaining));
                 if ($chunk === false || $chunk === '') {
-                    log('WARN', "Unexpected EOF in chunk data — $bucket/$key | bytes remaining: $remaining");
+                    writeLog('WARN', "Unexpected EOF in chunk data — $bucket/$key | bytes remaining: $remaining");
                     break 2;
                 }
                 fwrite($out, $chunk);
@@ -446,7 +446,7 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
     header('Content-Type: application/xml');
     header('ETag: "' . md5_file($fullPath) . '"');
     echo "<PutObjectResult/>";
-    log('INFO', "Object saved: $bucket/$key");
+    writeLog('INFO', "Object saved: $bucket/$key");
 }
 
 
@@ -461,19 +461,19 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
 function handleHead(string $key, string $bucketDir, string $bucket): void
 {
     if ($key === '') {
-        log('ERROR', "HEAD request missing key — bucket: '$bucket'");
+        writeLog('ERROR', "HEAD request missing key — bucket: '$bucket'");
         sendError(400, 'InvalidRequest', 'HEAD request requires an object key');
     }
 
     $f        = "$bucketDir/$key";
     $realPath = realpath($f);
 
-    log('DEBUG', "HEAD — key: '$key' | candidate: '$f' | resolved: '" . ($realPath ?: 'not found') . "'");
+    writeLog('DEBUG', "HEAD — key: '$key' | candidate: '$f' | resolved: '" . ($realPath ?: 'not found') . "'");
 
     if ($realPath !== false && is_file($realPath)) {
         http_response_code(200);
         header('Content-Type: application/octet-stream');
-        log('INFO', "HEAD 200: $bucket/$key");
+        writeLog('INFO', "HEAD 200: $bucket/$key");
     } else {
         sendError(404, 'NoSuchKey', 'Object not found');
     }
@@ -511,7 +511,7 @@ function downloadObject(string $bucketDir, string $key, string $bucket): void
     header('Content-Type: application/octet-stream');
     header('Content-Length: ' . filesize($realPath));
     readfile($realPath);
-    log('INFO', "GET 200: $bucket/$key");
+    writeLog('INFO', "GET 200: $bucket/$key");
 }
 
 /**
@@ -520,7 +520,7 @@ function downloadObject(string $bucketDir, string $key, string $bucket): void
  */
 function listBucket(string $bucketDir, string $bucket): void
 {
-    log('DEBUG', "LIST bucket='$bucket' dir='$bucketDir'");
+    writeLog('DEBUG', "LIST bucket='$bucket' dir='$bucketDir'");
 
     if (!is_dir($bucketDir)) {
         sendError(404, 'NoSuchBucket', "Bucket '$bucket' does not exist");
@@ -536,7 +536,7 @@ function listBucket(string $bucketDir, string $bucket): void
     }
 
     echo "</ListBucketResult>";
-    log('INFO', "LIST $bucket — " . count($objects) . " object(s) returned");
+    writeLog('INFO', "LIST $bucket — " . count($objects) . " object(s) returned");
 }
 
 /**
@@ -595,9 +595,9 @@ function deleteBucket(string $bucketDir, string $bucket): void
 
     if (deleteDirectoryRecursive($bucketDir)) {
         http_response_code(204);
-        log('INFO', "Bucket deleted: $bucket");
+        writeLog('INFO', "Bucket deleted: $bucket");
     } else {
-        log('ERROR', "rmdir failed for bucket directory: $bucketDir");
+        writeLog('ERROR', "rmdir failed for bucket directory: $bucketDir");
         sendError(500, 'InternalError', 'Failed to delete bucket directory');
     }
 }
@@ -642,7 +642,7 @@ function deleteObject(string $bucketDir, string $key, string $bucket): void
 
     unlink($realPath);
     http_response_code(204);
-    log('INFO', "Object deleted: $bucket/$key");
+    writeLog('INFO', "Object deleted: $bucket/$key");
 }
 
 
@@ -656,14 +656,31 @@ error_reporting(E_ALL);
 
 loadEnv(__DIR__ . '/.env');
 
-$debug       = envToBool($_ENV['DEBUG']        ?? 'false');            // string fallback required — see envToBool()
-$accessKey   = $_ENV['ACCESS_KEY']             ?? '';
-$secretKey   = $_ENV['SECRET_KEY']             ?? '';
-$region      = $_ENV['REGION']                 ?? 'us-east-1';        // must match the region string the client sends
-$storageRoot = __DIR__ . '/' . ($_ENV['STORAGE_ROOT'] ?? '../data');
-$logFile     = __DIR__ . '/' . ($_ENV['LOG_FILE']     ?? 'activities.log');
+// $_ENV is only populated when php.ini's variables_order contains 'E' (absent on many installs).
+// getenv() reads the real process environment unconditionally, so it works whether the values
+// came from a .env file (loaded above into $_ENV) or were injected directly by the parent
+// process (e.g. the integration test suite via proc_open).  Checking $_ENV first preserves
+// the .env-file path; getenv() is the fallback for the process-environment path.
+$debug     = envToBool($_ENV['DEBUG']      ?? getenv('DEBUG')      ?: 'false');  // string fallback required — see envToBool()
+$accessKey = $_ENV['ACCESS_KEY']           ?? getenv('ACCESS_KEY') ?: '';
+$secretKey = $_ENV['SECRET_KEY']           ?? getenv('SECRET_KEY') ?: '';
+$region    = $_ENV['REGION']               ?? getenv('REGION')     ?: 'us-east-1';  // must match the region string the client sends
 
-// Uncaught exceptions bypass log() but are still always written as ERROR.
+// STORAGE_ROOT and LOG_FILE may be absolute paths (e.g. an integration test injecting
+// a temp directory) or relative paths anchored to the project root (the normal .env case).
+// An absolute path starts with a Unix root ('/'), a Windows drive letter ('C:\' or 'C:/'),
+// or a UNC path ('\\').  Everything else is treated as relative to __DIR__.
+$storageRootRaw = $_ENV['STORAGE_ROOT'] ?? getenv('STORAGE_ROOT') ?: '../data';
+$storageRoot    = preg_match('/^([A-Za-z]:[\\\\\/]|\/|\\\\\\\\)/', $storageRootRaw)
+    ? rtrim($storageRootRaw, '/\\')
+    : __DIR__ . '/' . $storageRootRaw;
+
+$logFileRaw = $_ENV['LOG_FILE'] ?? getenv('LOG_FILE') ?: 'activities.log';
+$logFile    = preg_match('/^([A-Za-z]:[\\\\\/]|\/|\\\\\\\\)/', $logFileRaw)
+    ? $logFileRaw
+    : __DIR__ . '/' . $logFileRaw;
+
+// Uncaught exceptions bypass writeLog() but are still always written as ERROR.
 // The handler is wired directly to avoid dependency on $debug state at throw time.
 set_exception_handler(function (Throwable $e) use ($logFile): void {
     $logDir = dirname($logFile);
@@ -684,12 +701,12 @@ set_exception_handler(function (Throwable $e) use ($logFile): void {
 });
 
 // Request start — INFO so it only appears when DEBUG=true
-log('INFO', str_repeat('-', 60));
-log('INFO', $_SERVER['REQUEST_METHOD'] . ' ' . $_SERVER['REQUEST_URI']);
+writeLog('INFO', str_repeat('-', 60));
+writeLog('INFO', $_SERVER['REQUEST_METHOD'] . ' ' . $_SERVER['REQUEST_URI']);
 
 // Individual headers are DEBUG — noisy but invaluable when tracing signature issues
 foreach (getallheaders() as $name => $value) {
-    log('DEBUG', "Header: $name: $value");
+    writeLog('DEBUG', "Header: $name: $value");
 }
 
 checkSignature();
@@ -700,7 +717,7 @@ $bucket    = $uriParts[0] ?? '';
 $key       = $uriParts[1] ?? '';
 $bucketDir = "$storageRoot/$bucket";
 
-log('DEBUG', "Routed — bucket: '$bucket' | key: '$key' | dir: '$bucketDir'");
+writeLog('DEBUG', "Routed — bucket: '$bucket' | key: '$key' | dir: '$bucketDir'");
 
 $method = $_SERVER['REQUEST_METHOD'];
 
