@@ -20,7 +20,7 @@
         }
     },
     "scripts": {
-        "start":               "@php -S localhost:8080 index.php",
+        "start":               "@php -S localhost:9000 index.php",
 
         "test":                "phpunit",
         "test:unit":           "phpunit --testsuite Unit",
@@ -32,7 +32,7 @@
         "coverage:ci":         "phpunit --log-junit coverage/junit.xml --coverage-text=coverage/coverage.txt"
     },
     "scripts-descriptions": {
-        "start":               "Start the built-in PHP development server on :8080",
+        "start":               "Start the built-in PHP development server on :9000",
         "test":                "Run the full test suite (no coverage)",
         "test:unit":           "Run only the Unit testsuite (fast, no server)",
         "test:integration":    "Run only the Integration testsuite (starts a real PHP server)",

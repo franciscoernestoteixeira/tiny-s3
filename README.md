@@ -169,11 +169,11 @@ location ~ \.php$ {
 composer start
 ```
 
-This runs `php -S localhost:8080 index.php`. To bind to all interfaces instead
+This runs `php -S localhost:9000 index.php`. To bind to all interfaces instead
 (e.g. to reach the server from another machine on the same network):
 
 ```bash
-php -S 0.0.0.0:8080 index.php
+php -S 0.0.0.0:9000 index.php
 ```
 
 ---
@@ -200,11 +200,11 @@ See `.env.template` for full documentation of every variable.
 
 ```bash
 aws s3 mb s3://my-bucket \
-  --endpoint-url http://localhost:8080 \
+  --endpoint-url http://localhost:9000 \
   --no-verify-ssl
 
 aws s3 cp file.txt s3://my-bucket/file.txt \
-  --endpoint-url http://localhost:8080
+  --endpoint-url http://localhost:9000
 ```
 
 Set credentials in `~/.aws/credentials` or via environment variables:
@@ -222,7 +222,7 @@ import boto3
 
 s3 = boto3.client(
     's3',
-    endpoint_url='http://localhost:8080',
+    endpoint_url='http://localhost:9000',
     aws_access_key_id='your-access-key-here',
     aws_secret_access_key='your-secret-key-here',
     region_name='us-east-1',
@@ -242,7 +242,7 @@ provider = Other
 access_key_id = your-access-key-here
 secret_access_key = your-secret-key-here
 region = us-east-1
-endpoint = http://localhost:8080
+endpoint = http://localhost:9000
 ```
 
 ```bash
@@ -311,7 +311,7 @@ chmod +x test.sh
 ./test.sh
 
 # Override any value inline
-ENDPOINT=http://192.168.1.10:8080 ACCESS_KEY=mykey SECRET_KEY=mysecret ./test.sh
+ENDPOINT=http://192.168.1.10:9000 ACCESS_KEY=mykey SECRET_KEY=mysecret ./test.sh
 ```
 
 #### PowerShell (Windows / cross-platform)
@@ -321,7 +321,7 @@ Uses only built-in `System.Security.Cryptography` — no extra modules needed.
 
 ```powershell
 .\test.ps1
-.\test.ps1 -Endpoint http://192.168.1.10:8080 -AccessKey mykey -SecretKey mysecret
+.\test.ps1 -Endpoint http://192.168.1.10:9000 -AccessKey mykey -SecretKey mysecret
 ```
 
 ---

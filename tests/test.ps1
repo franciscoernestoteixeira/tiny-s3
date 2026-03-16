@@ -20,7 +20,7 @@
 # ==============================================================================
 
 param(
-    [string] $Endpoint  = "http://localhost:8080",
+    [string] $Endpoint  = "http://localhost:9000",
     [string] $AccessKey = "your-access-key-here",
     [string] $SecretKey = "your-secret-key-here",
     [string] $Region    = "us-east-1",
@@ -98,7 +98,7 @@ function Invoke-S3Request {
     )
 
     $Service = "s3"
-    $Host    = ([uri]$Endpoint).Authority   # e.g. "localhost:8080"
+    $Host    = ([uri]$Endpoint).Authority   # e.g. "localhost:9000"
 
     # Timestamps — AWS requires both ISO 8601 long form and short date
     $AmzDate   = [datetime]::UtcNow.ToString("yyyyMMddTHHmmssZ")

@@ -25,7 +25,7 @@
 # Configuration — override any of these via environment variables:
 #   ENDPOINT=http://myserver ACCESS_KEY=mykey SECRET_KEY=mysecret ./test.sh
 # ------------------------------------------------------------------------------
-ENDPOINT="${ENDPOINT:-http://localhost:8080}"
+ENDPOINT="${ENDPOINT:-http://localhost:9000}"
 ACCESS_KEY="${ACCESS_KEY:-your-access-key-here}"
 SECRET_KEY="${SECRET_KEY:-your-secret-key-here}"
 REGION="${REGION:-us-east-1}"
