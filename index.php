@@ -83,10 +83,36 @@ function envToBool(string $value): bool
 // ================================================================================================
 
 /**
+ * Return a compact request-context tag for use in log lines.
+ *
+ * Included automatically by writeLog() on ERROR and WARN entries so that every
+ * failure record carries enough information to identify and reproduce the request
+ * without needing DEBUG mode or a separate access log.
+ *
+ * Format: [<ip> <METHOD> <URI>]
+ * Example: [203.0.113.42 PUT /my-bucket/uploads/photo.jpg]
+ *
+ * X-Forwarded-For is preferred over REMOTE_ADDR so that the real client IP is
+ * recorded when the server sits behind a reverse proxy or load balancer.
+ */
+function requestContext(): string
+{
+    $ip     = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '-';
+    $method = $_SERVER['REQUEST_METHOD']        ?? '-';
+    $uri    = $_SERVER['REQUEST_URI']           ?? '-';
+
+    return "[{$ip} {$method} {$uri}]";
+}
+
+/**
  * Write a timestamped log entry to the log file.
  *
  * ERROR and WARN are always persisted regardless of the DEBUG setting.
  * INFO  and DEBUG are only persisted when DEBUG=true.
+ *
+ * ERROR and WARN lines are automatically prefixed with requestContext() so that
+ * every failure record carries the client IP, HTTP method, and URI — no call-site
+ * changes are needed, and future error/warn calls get the context for free.
  *
  * The log directory is created automatically on first write if it does not yet exist,
  * so paths like `logs/2024/activities.log` work without any manual directory setup.
@@ -104,13 +130,28 @@ function writeLog(string $level, string $message): void
         return;
     }
 
+    $context = $alwaysLog ? ' ' . requestContext() : '';
+    $line = '[' . date('Y-m-d H:i:s') . '] [' . $level . ']' . $context . ' ' . $message . PHP_EOL;
+
+    // Guard: $logFile may be empty if the globals were never initialised (e.g. a
+    // function called before the bootstrap ran, or a silent loadEnv() failure).
+    // Fall back to PHP's error_log() so the message is never silently discarded.
+    if (!$logFile) {
+        error_log('[tiny-s3] ' . trim($line));
+        return;
+    }
+
     $logDir = dirname($logFile);
     if (!is_dir($logDir)) {
         mkdir($logDir, 0755, true);
     }
 
-    $line = '[' . date('Y-m-d H:i:s') . '] [' . $level . '] ' . $message . PHP_EOL;
-    file_put_contents($logFile, $line, FILE_APPEND);
+    if (file_put_contents($logFile, $line, FILE_APPEND) === false) {
+        // Write to PHP's error log so the failure is visible in the server console
+        // or web-server error log — never silently drop a log entry.
+        error_log('[tiny-s3] Cannot write to log file: ' . $logFile);
+        error_log('[tiny-s3] ' . trim($line));
+    }
 }
 
 
@@ -133,6 +174,11 @@ function xmlElement(string $tag, string $content): string
  * All error responses use <e> as the root tag — AWS S3 clients always expect this.
  * Routing every error through this one function keeps the format consistent.
  *
+ * HEAD responses must never include a body (RFC 9110 §9.3.2). Sending one causes
+ * some HTTP clients (including the AWS SDK via Guzzle) to misparse the response
+ * and throw an unexpected exception rather than handling the status code cleanly.
+ * The body is therefore suppressed when the current method is HEAD.
+ *
  * @param int    $httpCode  HTTP status code (e.g. 403, 404, 500)
  * @param string $code      S3 error code string (e.g. "NoSuchKey")
  * @param string $message   Human-readable description
@@ -141,14 +187,202 @@ function sendError(int $httpCode, string $code, string $message): never
 {
     http_response_code($httpCode);
     header('Content-Type: application/xml');
-    echo "<e>" . xmlElement('Code', $code) . xmlElement('Message', $message) . "</e>";
+
+    // HEAD responses must not carry a body — suppress it for HTTP compliance.
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'HEAD') {
+        echo "<e>" . xmlElement('Code', $code) . xmlElement('Message', $message) . "</e>";
+    }
+
     writeLog('ERROR', "HTTP $httpCode [$code] $message");
     exit;
 }
 
 
 // ================================================================================================
-// SECTION 4 — AWS SIGNATURE V4
+// SECTION 4 — IP ALLOWLIST
+//
+// Optional network-level access control evaluated before any cryptographic check.
+// Rejecting blocked IPs here avoids wasting CPU on signature computation.
+//
+// Rules are read from the ALLOWED_IPS environment variable as a comma- or
+// space-separated list of entries. Each entry may be:
+//
+//   *                 — wildcard; allow any IP (same as leaving the variable empty)
+//   203.0.113.42      — exact IPv4 address
+//   2001:db8::1       — exact IPv6 address
+//   203.0.113.0/24    — IPv4 CIDR block
+//   2001:db8::/32     — IPv6 CIDR block
+//
+// Multiple entries are OR-ed: access is granted if any single entry matches.
+// An empty or wildcard value disables the allowlist entirely.
+//
+// REMOTE_ADDR is used for the comparison — not X-Forwarded-For — because
+// X-Forwarded-For is a client-supplied header and can be trivially spoofed
+// without strict reverse-proxy trust configuration. If Tiny S3 sits behind a
+// trusted proxy, configure the proxy to overwrite REMOTE_ADDR with the real
+// client IP (both Nginx and Apache support this via realip / remoteip modules)
+// rather than relying on X-Forwarded-For for security decisions.
+// ================================================================================================
+
+/**
+ * Parse the ALLOWED_IPS env string into a clean array of rules.
+ *
+ * Splits on any combination of commas and whitespace.
+ * Returns an empty array when the raw value is empty or the single-entry wildcard "*",
+ * which the caller treats as "open to all".
+ *
+ * @return string[]
+ */
+function parseAllowedIps(string $raw): array
+{
+    $trimmed = trim($raw);
+
+    if ($trimmed === '' || $trimmed === '*') {
+        return [];
+    }
+
+    return array_values(
+        array_filter(
+            array_map('trim', preg_split('/[\s,]+/', $trimmed))
+        )
+    );
+}
+
+/**
+ * Test whether $ip falls within the CIDR range $cidr.
+ *
+ * Works for both IPv4 (uses ip2long bitmask arithmetic) and
+ * IPv6 (uses inet_pton byte-level comparison).
+ * A plain IP with no prefix (no "/") is treated as an exact match.
+ */
+function cidrMatch(string $ip, string $cidr): bool
+{
+    if (!str_contains($cidr, '/')) {
+        return $ip === $cidr;
+    }
+
+    [$subnet, $prefixStr] = explode('/', $cidr, 2);
+    $prefix = (int) $prefixStr;
+
+    // IPv4
+    if (str_contains($subnet, '.')) {
+        $ipLong     = ip2long($ip);
+        $subnetLong = ip2long($subnet);
+
+        if ($ipLong === false || $subnetLong === false || $prefix < 0 || $prefix > 32) {
+            return false;
+        }
+
+        $mask = $prefix === 0 ? 0 : (~0 << (32 - $prefix));
+
+        return ($ipLong & $mask) === ($subnetLong & $mask);
+    }
+
+    // IPv6
+    $ipBin     = inet_pton($ip);
+    $subnetBin = inet_pton($subnet);
+
+    if ($ipBin === false || $subnetBin === false || $prefix < 0 || $prefix > 128) {
+        return false;
+    }
+
+    $fullBytes = intdiv($prefix, 8);
+    $remainder = $prefix % 8;
+
+    // Compare all fully-covered bytes
+    if (substr($ipBin, 0, $fullBytes) !== substr($subnetBin, 0, $fullBytes)) {
+        return false;
+    }
+
+    // Compare the partial byte (if prefix is not on a byte boundary)
+    if ($remainder === 0) {
+        return true;
+    }
+
+    $mask = 0xFF & (0xFF << (8 - $remainder));
+
+    return (ord($ipBin[$fullBytes]) & $mask) === (ord($subnetBin[$fullBytes]) & $mask);
+}
+
+/**
+ * Return true if $ip is a loopback address (IPv4 127.x.x.x or IPv6 ::1).
+ *
+ * Loopback addresses can only originate from the same server process — they are
+ * always trusted regardless of the ALLOWED_IPS list.  This matters when the S3
+ * client (e.g. a Laravel app) runs on the same machine as Tiny S3: the outbound
+ * request will carry REMOTE_ADDR = 127.0.0.1 even if the configured ALLOWED_IPS
+ * only lists the server's public IP.
+ */
+function isLoopback(string $ip): bool
+{
+    // IPv6 loopback
+    if ($ip === '::1') {
+        return true;
+    }
+    // Full IPv4 loopback range: 127.0.0.0/8
+    $long = ip2long($ip);
+    return $long !== false && ($long & 0xFF000000) === 0x7F000000;
+}
+
+/**
+ * Return true if $clientIp is permitted by the allowlist rules.
+ *
+ * An empty $rules array means "open to all" (allowlist disabled).
+ * Otherwise, access is granted when any single rule matches.
+ *
+ * @param string[] $rules Parsed allowlist rules from parseAllowedIps()
+ */
+function isIpAllowed(string $clientIp, array $rules): bool
+{
+    if (empty($rules)) {
+        return true;
+    }
+
+    foreach ($rules as $rule) {
+        if (cidrMatch($clientIp, $rule)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Enforce the IP allowlist.
+ *
+ * Reads the parsed $allowedIps global, resolves the real client IP from REMOTE_ADDR,
+ * and calls sendError(403) if the IP is not on the list.
+ * Called at the very top of the request pipeline, before signature verification.
+ *
+ * Loopback addresses (127.x.x.x, ::1) are always allowed — they can only originate
+ * from the same server.  This is essential when the S3 client and Tiny S3 share a
+ * host: the internal HTTP request carries REMOTE_ADDR = 127.0.0.1, not the server's
+ * public IP, so the allowlist would otherwise silently block legitimate local calls.
+ */
+function checkIpAllowlist(): void
+{
+    $rules    = parseAllowedIps($GLOBALS['allowedIps']);
+    $clientIp = $_SERVER['REMOTE_ADDR'] ?? '';
+
+    if (empty($rules)) {
+        return; // Allowlist disabled — open to all
+    }
+
+    // Loopback is always trusted — it cannot arrive from outside the server.
+    if (isLoopback($clientIp)) {
+        writeLog('DEBUG', "IP allowlist — loopback passthrough: '$clientIp'");
+        return;
+    }
+
+    if (!isIpAllowed($clientIp, $rules)) {
+        writeLog('ERROR', "IP not in allowlist — client: '$clientIp'");
+        sendError(403, 'AccessDenied', 'Your IP address is not allowed');
+    }
+}
+
+
+// ================================================================================================
+// SECTION 5 — AWS SIGNATURE V4
 // ================================================================================================
 
 /**
@@ -290,7 +524,7 @@ function checkSignature(): void
 
 
 // ================================================================================================
-// SECTION 5 — PATH SAFETY HELPER
+// SECTION 6 — PATH SAFETY HELPER
 // ================================================================================================
 
 /**
@@ -325,9 +559,34 @@ function resolveSafePath(string $bucketDir, string $key): string
     return $resolvedPath;
 }
 
+/**
+ * Validate an object key supplied by the client for use in a write (PUT) operation.
+ *
+ * resolveSafePath() relies on realpath(), which requires the target file to already
+ * exist on disk — it cannot be used for new uploads.  This function fills that gap:
+ * it inspects the key's components *before* any file is created and rejects keys
+ * that contain ".." path segments, which could otherwise escape the bucket directory.
+ *
+ * Logs the attempt as ERROR and exits with 400 on a bad key.
+ *
+ * @param string $key    Object key provided by the client
+ * @param string $bucket Bucket name, used for logging only
+ */
+function validateUploadKey(string $key, string $bucket): void
+{
+    // Split on both Unix '/' and Windows '\' separators for robustness
+    $parts = preg_split('#[/\\\\]#', $key);
+    foreach ($parts as $part) {
+        if ($part === '..') {
+            writeLog('ERROR', "Path traversal attempt in upload key — key: '$key' | bucket: '$bucket'");
+            sendError(400, 'InvalidKey', 'Object key may not contain ".." path components');
+        }
+    }
+}
+
 
 // ================================================================================================
-// SECTION 6 — PUT: BUCKET CREATION & OBJECT UPLOAD
+// SECTION 7 — PUT: BUCKET CREATION & OBJECT UPLOAD
 // ================================================================================================
 
 /**
@@ -375,16 +634,32 @@ function createBucket(string $bucketDir, string $bucket): void
  */
 function uploadObject(string $bucketDir, string $key, string $bucket): void
 {
+    validateUploadKey($key, $bucket);
+
     $fullPath = "$bucketDir/$key";
     $dirPath  = dirname($fullPath);
 
     // Auto-create intermediate directories for keys containing `/` path separators
     if (!is_dir($dirPath)) {
-        mkdir($dirPath, 0755, true);
+        if (!mkdir($dirPath, 0755, true)) {
+            writeLog('ERROR', "mkdir failed for object directory: $dirPath");
+            sendError(500, 'InternalError', 'Could not create object directory');
+        }
     }
 
-    $out       = fopen($fullPath, 'w');
-    $in        = fopen('php://input', 'r');
+    $out = fopen($fullPath, 'w');
+    if ($out === false) {
+        writeLog('ERROR', "fopen failed for write — path: $fullPath");
+        sendError(500, 'InternalError', 'Could not open object for writing');
+    }
+
+    $in = fopen('php://input', 'r');
+    if ($in === false) {
+        fclose($out);
+        writeLog('ERROR', "fopen failed for request body — path: $fullPath");
+        sendError(500, 'InternalError', 'Could not read request body');
+    }
+
     $isChunked = ($_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '') === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER';
 
     writeLog('INFO', "Upload started — mode: " . ($isChunked ? 'aws-chunked' : 'normal') . " | path: $fullPath");
@@ -451,7 +726,7 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
 
 
 // ================================================================================================
-// SECTION 7 — HEAD: OBJECT EXISTENCE CHECK
+// SECTION 8 — HEAD: OBJECT EXISTENCE CHECK
 // ================================================================================================
 
 /**
@@ -465,23 +740,24 @@ function handleHead(string $key, string $bucketDir, string $bucket): void
         sendError(400, 'InvalidRequest', 'HEAD request requires an object key');
     }
 
-    $f        = "$bucketDir/$key";
-    $realPath = realpath($f);
+    // resolveSafePath() verifies the resolved path stays inside the bucket directory,
+    // preventing crafted keys from probing arbitrary files on the filesystem.
+    $realPath = resolveSafePath($bucketDir, $key);
 
-    writeLog('DEBUG', "HEAD — key: '$key' | candidate: '$f' | resolved: '" . ($realPath ?: 'not found') . "'");
+    writeLog('DEBUG', "HEAD — key: '$key' | resolved: '$realPath'");
 
-    if ($realPath !== false && is_file($realPath)) {
-        http_response_code(200);
-        header('Content-Type: application/octet-stream');
-        writeLog('INFO', "HEAD 200: $bucket/$key");
-    } else {
+    if (!is_file($realPath)) {
         sendError(404, 'NoSuchKey', 'Object not found');
     }
+
+    http_response_code(200);
+    header('Content-Type: application/octet-stream');
+    writeLog('INFO', "HEAD 200: $bucket/$key");
 }
 
 
 // ================================================================================================
-// SECTION 8 — GET: OBJECT DOWNLOAD & BUCKET LISTING
+// SECTION 9 — GET: OBJECT DOWNLOAD & BUCKET LISTING
 // ================================================================================================
 
 /**
@@ -568,7 +844,7 @@ function listObjectsRecursively(string $dir, string $prefix = ''): array
 
 
 // ================================================================================================
-// SECTION 9 — DELETE: OBJECT & BUCKET REMOVAL
+// SECTION 10 — DELETE: OBJECT & BUCKET REMOVAL
 // ================================================================================================
 
 /**
@@ -647,8 +923,8 @@ function deleteObject(string $bucketDir, string $key, string $bucket): void
 
 
 // ================================================================================================
-// SECTION 10 — ENTRY POINT
-// Bootstrap, exception handler, signature check, URL parsing, method dispatch.
+// SECTION 11 — ENTRY POINT
+// Bootstrap, exception handler, IP allowlist check, signature check, URL parsing, method dispatch.
 //
 // Guarded by TINY_S3_TEST so that PHPUnit can require this file to register all
 // function definitions (and measure coverage) without triggering the HTTP bootstrap.
@@ -666,10 +942,11 @@ loadEnv(__DIR__ . '/.env');
 // came from a .env file (loaded above into $_ENV) or were injected directly by the parent
 // process (e.g. the integration test suite via proc_open).  Checking $_ENV first preserves
 // the .env-file path; getenv() is the fallback for the process-environment path.
-$debug     = envToBool($_ENV['DEBUG']      ?? getenv('DEBUG')      ?: 'false');  // string fallback required — see envToBool()
-$accessKey = $_ENV['ACCESS_KEY']           ?? getenv('ACCESS_KEY') ?: '';
-$secretKey = $_ENV['SECRET_KEY']           ?? getenv('SECRET_KEY') ?: '';
-$region    = $_ENV['REGION']               ?? getenv('REGION')     ?: 'us-east-1';  // must match the region string the client sends
+$debug      = envToBool($_ENV['DEBUG']       ?? getenv('DEBUG')       ?: 'false');  // string fallback required — see envToBool()
+$accessKey  = $_ENV['ACCESS_KEY']            ?? getenv('ACCESS_KEY')  ?: '';
+$secretKey  = $_ENV['SECRET_KEY']            ?? getenv('SECRET_KEY')  ?: '';
+$region     = $_ENV['REGION']                ?? getenv('REGION')      ?: 'us-east-1';  // must match the region string the client sends
+$allowedIps = $_ENV['ALLOWED_IPS']           ?? getenv('ALLOWED_IPS') ?: '';          // empty / "*" = open to all
 
 // STORAGE_ROOT and LOG_FILE may be absolute paths (e.g. an integration test injecting
 // a temp directory) or relative paths anchored to the project root (the normal .env case).
@@ -684,6 +961,36 @@ $logFileRaw = $_ENV['LOG_FILE'] ?? getenv('LOG_FILE') ?: 'activities.log';
 $logFile    = preg_match('/^([A-Za-z]:[\\\\\/]|\/|\\\\\\\\)/', $logFileRaw)
     ? $logFileRaw
     : __DIR__ . '/' . $logFileRaw;
+
+// Ensure the log file and its parent directory exist at startup.
+// Creating it eagerly — rather than lazily on first write — means:
+//   • operators can verify file permissions immediately after deployment
+//   • `tail -f activities.log` works before any request has arrived
+//   • the exception handler can always write without a redundant mkdir guard
+//
+// On shared hosting (e.g. a2hosting) the PHP process often cannot write to the
+// web-root directory.  When that happens we fall back to the system temp directory
+// so that logging always works, even before the operator has set a writable path.
+// The fallback file is printed at the start of every request when DEBUG=true.
+//
+// If even the temp-dir write fails, messages are sent to error_log() so they
+// appear in the web-server error log (Apache: error.log, PHP built-in: stderr).
+$_logBootDir = dirname($logFile);
+if (!is_dir($_logBootDir)) {
+    if (!mkdir($_logBootDir, 0755, true)) {
+        error_log("[tiny-s3] Cannot create log directory: $_logBootDir — check write permissions");
+    }
+}
+if (!file_exists($logFile)) {
+    if (!touch($logFile)) {
+        // Web-root not writable — fall back to the system temp directory.
+        // The hashed suffix keeps files for different deployments separate.
+        $logFile = sys_get_temp_dir() . '/tiny-s3-' . substr(md5(__DIR__), 0, 8) . '.log';
+        error_log("[tiny-s3] Cannot write to configured log path — falling back to: $logFile");
+        touch($logFile); // best-effort; failure handled per-write in writeLog()
+    }
+}
+unset($_logBootDir);
 
 // Uncaught exceptions bypass writeLog() but are still always written as ERROR.
 // The handler is wired directly to avoid dependency on $debug state at throw time.
@@ -707,6 +1014,7 @@ set_exception_handler(function (Throwable $e) use ($logFile): void {
 
 // Request start — INFO so it only appears when DEBUG=true
 writeLog('INFO', str_repeat('-', 60));
+writeLog('INFO', "Log: $logFile");
 writeLog('INFO', $_SERVER['REQUEST_METHOD'] . ' ' . $_SERVER['REQUEST_URI']);
 
 // Individual headers are DEBUG — noisy but invaluable when tracing signature issues
@@ -714,6 +1022,45 @@ foreach (getallheaders() as $name => $value) {
     writeLog('DEBUG', "Header: $name: $value");
 }
 
+// /__diag — diagnostic endpoint (must come before IP allowlist + signature checks)
+// Responds to GET /__diag?token=<SECRET_KEY> with a plain-text report of every
+// resolved config value, path, and write-permission check.
+// Useful when SSH is unavailable (shared hosting) and logging is not yet working.
+// Authentication: the SECRET_KEY itself is the token — only someone who already
+// knows the key can read the diagnostics.
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
+    && (parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) === '/__diag')
+    && hash_equals($secretKey, $_GET['token'] ?? '')
+    && $secretKey !== ''
+) {
+    header('Content-Type: text/plain; charset=utf-8');
+    $w = fn(string $path) => (is_writable($path) ? 'writable' : 'NOT WRITABLE');
+    $e = fn(string $path) => (file_exists($path)  ? 'exists'   : 'MISSING');
+    echo "Tiny S3 — diagnostic report\n";
+    echo str_repeat('=', 60) . "\n\n";
+    echo "PHP version   : " . PHP_VERSION . "\n";
+    echo "SAPI          : " . PHP_SAPI    . "\n";
+    echo "REMOTE_ADDR   : " . ($_SERVER['REMOTE_ADDR'] ?? '-') . "\n";
+    echo "HTTP_HOST     : " . ($_SERVER['HTTP_HOST']   ?? '-') . "\n";
+    echo "REQUEST_URI   : " . ($_SERVER['REQUEST_URI'] ?? '-') . "\n\n";
+    echo "--- Config ---\n";
+    echo "__DIR__       : " . __DIR__       . "  [" . $w(__DIR__)       . "]\n";
+    echo "STORAGE_ROOT  : " . $storageRoot  . "  [" . $e($storageRoot)  . "] [" . $w(dirname($storageRoot)) . "]\n";
+    echo "LOG_FILE      : " . $logFile      . "  [" . $e($logFile)      . "] [" . $w(dirname($logFile))     . "]\n";
+    echo "sys_get_temp_dir: " . sys_get_temp_dir() . "  [" . $w(sys_get_temp_dir()) . "]\n";
+    echo "DEBUG         : " . ($debug ? 'true' : 'false') . "\n";
+    echo "REGION        : " . $region      . "\n";
+    echo "ALLOWED_IPS   : " . ($allowedIps ?: '(open to all)') . "\n\n";
+    echo "--- .env ---\n";
+    echo ".env path     : " . __DIR__ . "/.env  [" . $e(__DIR__ . '/.env') . "]\n\n";
+    echo "--- Log write test ---\n";
+    $testLine = '[' . date('Y-m-d H:i:s') . '] [DIAG] diagnostic write test' . PHP_EOL;
+    $result   = file_put_contents($logFile, $testLine, FILE_APPEND);
+    echo "Write result  : " . ($result !== false ? "$result bytes written OK" : "FAILED") . "\n";
+    exit;
+}
+
+checkIpAllowlist();
 checkSignature();
 
 $uriPath   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);

@@ -136,9 +136,9 @@ nano .env   # fill in ACCESS_KEY, SECRET_KEY, etc.
 mkdir -p /var/www/data
 chown www-data:www-data /var/www/data
 
-# 5. Make the log file writable if you enable DEBUG
-touch activities.log
-chown www-data:www-data activities.log
+# 5. The log file is created automatically on first startup.
+#    Ensure the web server user can write to the project directory, or set
+#    LOG_FILE to an absolute path the server can write to (e.g. /var/log/tiny-s3.log).
 ```
 
 ### Apache — route all requests to index.php
@@ -189,8 +189,9 @@ See `.env.template` for full documentation of every variable.
 | `ACCESS_KEY`   | *(required)*     | Client-facing access key ID |
 | `SECRET_KEY`   | *(required)*     | Secret used to verify HMAC-SHA256 signatures |
 | `REGION`       | `us-east-1`      | Region string in the Signature V4 credential scope |
+| `ALLOWED_IPS`  | *(empty)*        | Comma/space-separated IPs and CIDR ranges allowed to connect; empty or `*` disables the check |
 | `STORAGE_ROOT` | `../data`        | Root directory for buckets and objects |
-| `LOG_FILE`     | `activities.log` | Log file path (relative to `index.php`) |
+| `LOG_FILE`     | `activities.log` | Log file path (relative to `index.php`); created automatically at startup |
 
 ---
 
@@ -508,11 +509,38 @@ Required Jenkins plugins: **HTML Publisher**, **Cobertura**, **JUnit**.
 
 ## Security Notes
 
-- **Path traversal protection** — all GET and DELETE operations resolve the object key with `realpath()` and verify the result stays inside the bucket directory before any file access or deletion.
+- **IP allowlist** — set `ALLOWED_IPS` in `.env` to restrict access to known IPs or CIDR ranges. The check runs before signature verification, so blocked clients never touch the crypto layer. Supports exact IPv4/IPv6 addresses and CIDR blocks; multiple entries are comma- or space-separated. Leave empty (or set to `*`) to disable. **Loopback addresses (`127.x.x.x`, `::1`) are always allowed automatically** — they can only come from the same server, so a co-hosted Laravel app does not need special configuration.
+- **Path traversal protection** — GET and DELETE resolve the object key with `realpath()` and verify the result stays inside the bucket directory. PUT validates the key's components before any file is created, rejecting keys containing `..` segments. HEAD uses the same `realpath()` bounds check as GET/DELETE.
 - **Timing-safe comparison** — signatures are compared with `hash_equals()` to prevent timing attacks.
 - **DEBUG mode** — logs full Authorization headers and signature internals. Always set `DEBUG = false` in production.
 - **HTTPS** — use a reverse proxy (Nginx, Caddy) with TLS in production. The built-in PHP server is plaintext only.
 - **Directory permissions** — `STORAGE_ROOT` should not be web-accessible. Place it outside the document root.
+
+---
+
+## Diagnostics
+
+When logging is not working (common on shared hosting where the web root is not writable by PHP), use the built-in diagnostic endpoint to inspect the server's resolved configuration without SSH access.
+
+```
+GET https://your-tiny-s3-host/__diag?token=YOUR_SECRET_KEY
+```
+
+The token is your `SECRET_KEY` value — only someone who already knows it can read the report. The response is plain text and includes:
+
+- PHP version and SAPI
+- `REMOTE_ADDR` as seen by Tiny S3 (useful for diagnosing IP allowlist issues)
+- Resolved absolute paths for `STORAGE_ROOT` and `LOG_FILE`, with existence and write-permission checks
+- The `sys_get_temp_dir()` fallback path if the configured log file is unwritable
+- A live write test to `LOG_FILE`
+
+**Shared hosting log file tip:** if the report shows `LOG_FILE` as `NOT WRITABLE`, add an absolute path to your `.env`:
+
+```dotenv
+LOG_FILE = /home/yourusername/logs/tiny-s3.log
+```
+
+Tiny S3 automatically falls back to `sys_get_temp_dir()` if the configured path is unwritable, so logging always works even before the path is corrected. The fallback path is shown in the `/__diag` report and in the web-server error log.
 
 ---
 

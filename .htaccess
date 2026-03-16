@@ -1,0 +1,18 @@
+# ==============================================================================
+#  Tiny S3 — Apache .htaccess
+#  Routes all requests to index.php, preserving method, URI, and query string.
+# ==============================================================================
+
+# Require mod_rewrite
+Options -Indexes
+RewriteEngine On
+
+# Pass Authorization header through to PHP.
+# CGI/FastCGI on shared hosting (a2hosting, cPanel) strips this header by
+# default — without it, every request fails signature verification with a
+# blank access key.
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+# Do not rewrite the diagnostic endpoint or index.php itself
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]
