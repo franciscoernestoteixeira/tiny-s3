@@ -533,17 +533,189 @@ function requestHeader(string $headerName): string
  */
 function buildCanonicalHeaders(string $signedHeaders): string
 {
+    return buildCanonicalHeadersWithOverrides($signedHeaders);
+}
+
+/**
+ * Build canonical headers with optional per-header overrides.
+ *
+ * This is used mainly for presigned URLs behind Docker, Nginx, Apache, or a
+ * reverse proxy. AWS Signature V4 signs the `host` header exactly as it was
+ * used when the URL was generated. A public client may sign `localhost`,
+ * `localhost:9000`, or `api.storage.flisol.app`, while PHP may see a different
+ * internal host after proxying. Normal Authorization-header requests remain
+ * strict; the compatibility logic is applied only to presigned URLs.
+ *
+ * @param array<string,string> $overrides Lowercase header names mapped to canonical values.
+ */
+function buildCanonicalHeadersWithOverrides(string $signedHeaders, array $overrides = []): string
+{
     $headers = array_filter(array_map('trim', explode(';', strtolower($signedHeaders))));
     sort($headers, SORT_STRING);
 
     $canonical = '';
     foreach ($headers as $headerName) {
-        $value = preg_replace('/\s+/', ' ', trim(requestHeader($headerName))) ?? '';
+        $value = array_key_exists($headerName, $overrides)
+            ? (string)$overrides[$headerName]
+            : requestHeader($headerName);
+
+        $value = preg_replace('/\s+/', ' ', trim($value)) ?? '';
         $canonical .= $headerName . ':' . $value . "
 ";
     }
 
     return $canonical;
+}
+
+/**
+ * Return unique host candidates for validating presigned URLs.
+ *
+ * The first candidate is always the real request Host header. Additional
+ * candidates are accepted only as a pragmatic compatibility layer for Docker
+ * port mapping and reverse proxies. This lets Tiny S3 validate URLs generated
+ * for a public endpoint even when PHP sees an internal Host value.
+ */
+function presignedHostCandidates(): array
+{
+    $candidates = [];
+
+    $add = static function (?string $host) use (&$candidates): void {
+        $host = trim((string)$host);
+        if ($host === '') {
+            return;
+        }
+
+        // X-Forwarded-Host can contain a chain. The left-most value is the
+        // original public host according to common proxy conventions.
+        if (str_contains($host, ',')) {
+            $host = trim(explode(',', $host, 2)[0]);
+        }
+
+        // Some proxy headers may include a scheme by mistake. The canonical
+        // SigV4 host value is only "host[:port]", never "scheme://host".
+        if (str_contains($host, '://')) {
+            $parts = parse_url($host);
+            if (is_array($parts) && !empty($parts['host'])) {
+                $host = $parts['host'] . (isset($parts['port']) ? ':' . $parts['port'] : '');
+            }
+        }
+
+        $host = strtolower($host);
+
+        if ($host !== '' && !in_array($host, $candidates, true)) {
+            $candidates[] = $host;
+        }
+    };
+
+    $add(requestHeader('host'));
+    $add($_SERVER['HTTP_X_FORWARDED_HOST'] ?? null);
+    $add($_SERVER['HTTP_X_ORIGINAL_HOST'] ?? null);
+    $add($_SERVER['HTTP_X_HOST'] ?? null);
+
+    // RFC 7239 Forwarded header example:
+    //   Forwarded: for=192.0.2.60;proto=https;host=api.example.com:443
+    // Some reverse proxies prefer this header over X-Forwarded-Host.
+    $forwarded = $_SERVER['HTTP_FORWARDED'] ?? '';
+    if ($forwarded !== '' && preg_match('/(?:^|[;,])\s*host="?([^";,]+)"?/i', $forwarded, $m)) {
+        $add($m[1]);
+    }
+
+    foreach (['TINY_S3_PUBLIC_URL', 'PUBLIC_URL', 'APP_URL'] as $envName) {
+        $url = getenv($envName) ?: ($_ENV[$envName] ?? '');
+        if ($url === '') {
+            continue;
+        }
+
+        $parts = parse_url($url);
+        if (!is_array($parts) || empty($parts['host'])) {
+            $add($url);
+            continue;
+        }
+
+        $host = $parts['host'];
+        if (isset($parts['port'])) {
+            $host .= ':' . $parts['port'];
+        }
+        $add($host);
+
+        // Default HTTPS/HTTP ports are not included in the Host header by many
+        // clients when generating presigned URLs, but reverse proxies may still
+        // pass them through. Try both forms for presigned URLs only.
+        if (!isset($parts['port']) && isset($parts['scheme'])) {
+            $scheme = strtolower((string)$parts['scheme']);
+            if ($scheme === 'https') {
+                $add($parts['host'] . ':443');
+            } elseif ($scheme === 'http') {
+                $add($parts['host'] . ':80');
+            }
+        }
+    }
+
+    $extraHosts = getenv('TINY_S3_PRESIGNED_HOSTS') ?: ($_ENV['TINY_S3_PRESIGNED_HOSTS'] ?? '');
+    foreach (preg_split('/[,\s]+/', (string)$extraHosts, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $host) {
+        $add($host);
+    }
+
+    // Docker/local convenience: a URL signed for localhost may be opened through
+    // localhost:9000, or the reverse may be true. AWS itself is strict, but this
+    // fallback avoids false negatives in local S3-emulator workflows.
+    foreach ($candidates as $host) {
+        if (preg_match('/^([^:\[\]]+):(\d+)$/', $host, $m)) {
+            $add($m[1]);
+        }
+    }
+
+    // Loopback aliases are common when Docker, Nginx or a browser rewrites the
+    // visible endpoint. A URL may be signed for "localhost" but arrive with a
+    // Host header of "127.0.0.1:9000", or the opposite. They are equivalent only
+    // for local development, so this compatibility is limited to loopback names.
+    foreach ($candidates as $host) {
+        if (preg_match('/^(localhost|127\.0\.0\.1)(?::(\d+))?$/', $host, $m)) {
+            $alias = $m[1] === 'localhost' ? '127.0.0.1' : 'localhost';
+            $add($alias);
+            if (!empty($m[2])) {
+                $add($alias . ':' . $m[2]);
+            }
+        }
+    }
+
+    return $candidates;
+}
+
+/**
+ * Return canonical URI candidates for presigned validation.
+ *
+ * Most deployments use the request URI as-is. Optional prefix support is here
+ * for reverse proxies that expose Tiny S3 under a path prefix and strip it
+ * before passing the request to PHP.
+ */
+function presignedCanonicalUriCandidates(string $path): array
+{
+    $candidates = [$path];
+
+    $prefixes = [];
+    $addPrefix = static function (?string $prefix) use (&$prefixes): void {
+        $prefix = trim((string)$prefix);
+        if ($prefix === '' || $prefix === '/') {
+            return;
+        }
+        $prefix = '/' . trim($prefix, '/');
+        if (!in_array($prefix, $prefixes, true)) {
+            $prefixes[] = $prefix;
+        }
+    };
+
+    $addPrefix($_SERVER['HTTP_X_FORWARDED_PREFIX'] ?? null);
+    $addPrefix(getenv('TINY_S3_PUBLIC_PATH_PREFIX') ?: ($_ENV['TINY_S3_PUBLIC_PATH_PREFIX'] ?? ''));
+
+    foreach ($prefixes as $prefix) {
+        $candidate = $prefix . ($path === '/' ? '' : $path);
+        if (!in_array($candidate, $candidates, true)) {
+            $candidates[] = $candidate;
+        }
+    }
+
+    return $candidates;
 }
 
 /**
@@ -845,48 +1017,77 @@ function checkPresignedUrlSignature(): void
     $method = $_SERVER['REQUEST_METHOD'];
     $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 
-    $signedHeaders    = normalizeSignedHeaders($auth['Signed']);
-    $canonicalHeaders = buildCanonicalHeaders($signedHeaders);
+    $signedHeaders = normalizeSignedHeaders($auth['Signed']);
 
     // S3 presigned URLs normally use UNSIGNED-PAYLOAD. If a client sends an
     // explicit X-Amz-Content-Sha256 query parameter, honour it for compatibility.
     $payloadHash = (string)($query['X-Amz-Content-Sha256'] ?? $query['x-amz-content-sha256'] ?? 'UNSIGNED-PAYLOAD');
 
-    $canonicalRequest = implode("
-", [
-        $method,
-        $path,
-        buildCanonicalQueryString($rawQuery, true),
-        $canonicalHeaders,
-        $signedHeaders,
-        $payloadHash,
-    ]);
+    $canonicalQuery = buildCanonicalQueryString($rawQuery, true);
+    $signingKey     = getSigningKey($auth['Date'], $GLOBALS['region'], 's3');
 
-    writeLog('DEBUG', "Presigned canonical request:
+    $lastCalculatedSig = '';
+    $lastCanonicalRequest = '';
+    $lastStringToSign = '';
+
+    $hostCandidates = str_contains(';' . $signedHeaders . ';', ';host;')
+        ? presignedHostCandidates()
+        : [''];
+
+    foreach (presignedCanonicalUriCandidates($path) as $canonicalUri) {
+        foreach ($hostCandidates as $hostCandidate) {
+            $overrides = [];
+            if ($hostCandidate !== '' && str_contains(';' . $signedHeaders . ';', ';host;')) {
+                $overrides['host'] = $hostCandidate;
+            }
+
+            $canonicalHeaders = buildCanonicalHeadersWithOverrides($signedHeaders, $overrides);
+
+            $canonicalRequest = implode("
+", [
+                $method,
+                $canonicalUri,
+                $canonicalQuery,
+                $canonicalHeaders,
+                $signedHeaders,
+                $payloadHash,
+            ]);
+
+            $stringToSign = implode("
+", [
+                'AWS4-HMAC-SHA256',
+                $amzDate,
+                $auth['Date'] . '/' . $GLOBALS['region'] . '/s3/aws4_request',
+                hash('sha256', $canonicalRequest),
+            ]);
+
+            $calculatedSig = hash_hmac('sha256', $stringToSign, $signingKey);
+
+            $lastCalculatedSig = $calculatedSig;
+            $lastCanonicalRequest = $canonicalRequest;
+            $lastStringToSign = $stringToSign;
+
+            writeLog('DEBUG', "Presigned signature candidate — host: "
+                . ($hostCandidate === '' ? '(none)' : $hostCandidate)
+                . " | uri: {$canonicalUri} | calculated: {$calculatedSig} | received: {$auth['Sig']}");
+
+            if (hash_equals($calculatedSig, $auth['Sig'])) {
+                writeLog('DEBUG', "Presigned canonical request:
 $canonicalRequest");
-
-    $stringToSign = implode("
-", [
-        'AWS4-HMAC-SHA256',
-        $amzDate,
-        $auth['Date'] . '/' . $GLOBALS['region'] . '/s3/aws4_request',
-        hash('sha256', $canonicalRequest),
-    ]);
-
-    writeLog('DEBUG', "Presigned string-to-sign:
+                writeLog('DEBUG', "Presigned string-to-sign:
 $stringToSign");
-
-    $signingKey    = getSigningKey($auth['Date'], $GLOBALS['region'], 's3');
-    $calculatedSig = hash_hmac('sha256', $stringToSign, $signingKey);
-
-    writeLog('DEBUG', "Presigned signature — calculated: $calculatedSig | received: {$auth['Sig']}");
-
-    if (!hash_equals($calculatedSig, $auth['Sig'])) {
-        writeLog('ERROR', "Presigned signature mismatch — calculated: $calculatedSig | received: {$auth['Sig']}");
-        sendError(403, 'SignatureDoesNotMatch', 'The presigned URL signature does not match');
+                writeLog('DEBUG', 'Presigned URL signature OK');
+                return;
+            }
+        }
     }
 
-    writeLog('DEBUG', 'Presigned URL signature OK');
+    writeLog('DEBUG', "Presigned canonical request:
+$lastCanonicalRequest");
+    writeLog('DEBUG', "Presigned string-to-sign:
+$lastStringToSign");
+    writeLog('ERROR', "Presigned signature mismatch — calculated: $lastCalculatedSig | received: {$auth['Sig']}");
+    sendError(403, 'SignatureDoesNotMatch', 'The presigned URL signature does not match');
 }
 
 /**

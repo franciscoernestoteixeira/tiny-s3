@@ -692,13 +692,47 @@ curl -X PUT --data-binary @upload.txt "$PRESIGNED_URL"
 
 ### Production endpoint example
 
-When Tiny S3 is running behind HTTPS at `api.test.org`, configure the generator with:
+When Tiny S3 is running behind HTTPS at `api.storage.flisol.app`, configure the generator with:
 
 ```python
-endpoint_url="https://api.test.org"
+endpoint_url="https://api.storage.flisol.app"
 ```
 
 The guest only needs the generated URL. It does not need `ACCESS_KEY` or `SECRET_KEY`.
+
+### Public host, Docker ports, and reverse proxies
+
+Presigned URLs are strict about the signed `host` value. The URL must normally be generated with the same public endpoint that the guest will use. For example, when Docker publishes Tiny S3 on port `9000`, generate the URL with:
+
+```python
+endpoint_url="http://localhost:9000"
+```
+
+Do **not** generate `https://localhost/...` and then manually change it to `http://localhost:9000/...`; changing the scheme/host/port/path after signing invalidates the URL.
+
+For production, use the external URL seen by guests:
+
+```python
+endpoint_url="https://api.storage.flisol.app"
+```
+
+When Tiny S3 runs behind Nginx/Apache or a container proxy, configure one of these optional variables so presigned validation can recognize the public host even if PHP receives an internal host:
+
+```env
+# Preferred public URL used by guests and by presigned URL generators.
+TINY_S3_PUBLIC_URL=https://api.storage.flisol.app
+
+# Optional comma-separated aliases accepted only for presigned URL validation.
+# Useful for local Docker tests, reverse proxies, or blue/green hostnames.
+TINY_S3_PRESIGNED_HOSTS=localhost,localhost:9000,api.storage.flisol.app
+
+# Optional only when a reverse proxy exposes Tiny S3 under a path prefix
+# and strips that prefix before passing the request to PHP.
+# Example public URL: https://example.org/storage/test/file.txt
+TINY_S3_PUBLIC_PATH_PREFIX=/storage
+```
+
+Tiny S3 first validates the signature using the real request `Host` header. For presigned URLs only, it can also try `X-Forwarded-Host`, the RFC 7239 `Forwarded` host value, `X-Original-Host`, `TINY_S3_PUBLIC_URL`, and `TINY_S3_PRESIGNED_HOSTS`. For local Docker usage, Tiny S3 also treats `localhost` and `127.0.0.1` as loopback aliases during presigned validation only. Normal Authorization-header requests remain strict.
 
 ---
 
@@ -904,3 +938,41 @@ tar xzf tiny-s3-data-backup.tar.gz -C ./data
 ## License
 
 MIT.
+
+## Cyberduck presigned URL note: localhost, HTTPS and custom ports
+
+Cyberduck can browse Tiny S3 correctly through a custom endpoint such as:
+
+```text
+http://localhost:9000
+```
+
+However, when using **Copy URL → Expires...**, Cyberduck may generate a presigned URL like:
+
+```text
+https://localhost/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&...
+```
+
+That URL is signed for the canonical SigV4 host value:
+
+```text
+localhost
+```
+
+and not for:
+
+```text
+localhost:9000
+```
+
+AWS Signature V4 signs the `Host` header. The scheme is not part of the signature, but the host and port are. If the URL is changed manually to include `:9000`, a strict S3 server would normally reject it. Tiny S3 intentionally accepts loopback aliases such as `localhost`, `localhost:9000`, `127.0.0.1`, and `127.0.0.1:9000` for presigned URLs only, so local Docker/Cyberduck workflows remain usable.
+
+Important: if the URL is `https://localhost/...` and Tiny S3 is only listening on `http://localhost:9000`, the request never reaches Tiny S3. There is no server-side PHP fix for a request that is sent to port 443 instead of port 9000. Use one of these options:
+
+1. Copy Cyberduck's **HTTP URL** when testing locally.
+2. Run a local reverse proxy on `https://localhost` that forwards to Tiny S3.
+3. Configure Cyberduck/bookmark endpoint so the generated presigned URL includes the reachable public endpoint.
+4. In production, set `TINY_S3_PUBLIC_URL=https://api.storage.flisol.app` and expose Tiny S3 through Nginx/Apache on port 443.
+
+To verify whether the request is reaching Tiny S3, enable `DEBUG=true` and check `activities.log`. A failed presigned URL validation logs `Presigned signature candidate`. If no such line appears, the request did not reach Tiny S3.
+
