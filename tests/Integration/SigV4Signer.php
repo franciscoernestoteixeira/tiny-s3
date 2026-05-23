@@ -94,4 +94,80 @@ class SigV4Signer
             'Authorization'         => $authHeader,
         ];
     }
+
+
+    /**
+     * Build an AWS Signature V4 presigned URL path for integration tests.
+     *
+     * The returned value is a path + query string, for example:
+     *   /my-bucket/file.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&...
+     *
+     * @param string $method     HTTP method the guest will use with this URL
+     * @param string $uriPath    Request path, e.g. /bucket or /bucket/key
+     * @param string $host       Host header value, e.g. localhost:18083
+     * @param int    $expires    URL lifetime in seconds, 1..604800
+     */
+    public function presign(string $method, string $uriPath, string $host, int $expires = 300): string
+    {
+        $amzDate   = gmdate('Ymd\THis\Z');
+        $dateStamp = gmdate('Ymd');
+
+        $credentialScope = "{$dateStamp}/{$this->region}/{$this->service}/aws4_request";
+
+        $query = [
+            'X-Amz-Algorithm'     => 'AWS4-HMAC-SHA256',
+            'X-Amz-Credential'    => "{$this->accessKey}/{$credentialScope}",
+            'X-Amz-Date'          => $amzDate,
+            'X-Amz-Expires'       => (string)$expires,
+            'X-Amz-SignedHeaders' => 'host',
+        ];
+
+        $canonicalQuery = $this->canonicalQuery($query);
+
+        $canonicalRequest = implode("\n", [
+            $method,
+            $uriPath,
+            $canonicalQuery,
+            "host:{$host}\n",
+            'host',
+            'UNSIGNED-PAYLOAD',
+        ]);
+
+        $stringToSign = implode("\n", [
+            'AWS4-HMAC-SHA256',
+            $amzDate,
+            $credentialScope,
+            hash('sha256', $canonicalRequest),
+        ]);
+
+        $kSecret  = "AWS4{$this->secretKey}";
+        $kDate    = hash_hmac('sha256', $dateStamp,       $kSecret,  true);
+        $kRegion  = hash_hmac('sha256', $this->region,    $kDate,    true);
+        $kService = hash_hmac('sha256', $this->service,   $kRegion,  true);
+        $kSigning = hash_hmac('sha256', 'aws4_request',   $kService, true);
+
+        $query['X-Amz-Signature'] = hash_hmac('sha256', $stringToSign, $kSigning);
+
+        return $uriPath . '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+    }
+
+    /**
+     * Canonicalize query parameters with AWS SigV4 encoding and ordering.
+     *
+     * @param array<string,string> $query
+     */
+    private function canonicalQuery(array $query): string
+    {
+        $pairs = [];
+
+        foreach ($query as $name => $value) {
+            $pairs[] = [rawurlencode($name), rawurlencode($value)];
+        }
+
+        usort($pairs, static function (array $a, array $b): int {
+            return $a[0] === $b[0] ? strcmp($a[1], $b[1]) : strcmp($a[0], $b[0]);
+        });
+
+        return implode('&', array_map(static fn(array $pair): string => $pair[0] . '=' . $pair[1], $pairs));
+    }
 }

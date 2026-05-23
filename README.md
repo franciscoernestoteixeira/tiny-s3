@@ -14,7 +14,7 @@ Objects are stored as plain files on the local filesystem. Buckets are directori
 - Single PHP application entry point: `index.php`.
 - No database.
 - No mandatory Composer dependencies for runtime.
-- AWS Signature V4 verification.
+- AWS Signature V4 verification through Authorization headers and presigned URLs.
 - Local filesystem storage.
 - Docker-ready runtime using **PHP 8.5 + PHP-FPM + Nginx**.
 - Easy deployment to a VPS using either Docker, Nginx, or Apache.
@@ -24,7 +24,7 @@ Objects are stored as plain files on the local filesystem. Buckets are directori
 
 ## Architecture and Flows
 
-The diagrams below describe the runtime flow, AWS Signature V4 validation, and the local filesystem mapping used by Tiny S3.
+The diagrams below describe the runtime flow, AWS Signature V4 validation, presigned URL validation, and the local filesystem mapping used by Tiny S3.
 
 ### Request Lifecycle
 
@@ -36,12 +36,19 @@ flowchart TD
     C -- GET /healthz --> HZ([200 OK])
     C -- GET /__diag<br/>token required --> DG([Diagnostic XML/JSON response])
     C -- No --> D{AWS Signature V4<br/>checkSignature}
+    D --> D1{Auth mode}
+    D1 -- Authorization header --> DH[Validate signed headers<br/>and payload hash]
+    D1 -- X-Amz-* query params --> DP[Validate presigned URL<br/>signature and expiry]
 
-    D -- ❌ 403 AccessDenied --> ERR([XML Error Response])
-    D -- ❌ 403 MissingDate --> ERR
-    D -- ❌ 403 SignatureDoesNotMatch --> ERR
+    DH -- ❌ 403 AccessDenied --> ERR([XML Error Response])
+    DH -- ❌ 403 MissingDate --> ERR
+    DH -- ❌ 403 SignatureDoesNotMatch --> ERR
+    DP -- ❌ 403 Expired/Invalid Signature --> ERR
 
-    D -- ✅ Valid --> E[Parse URI<br/>/bucket/key]
+    DH -- ✅ Valid --> NI{Unsupported S3 feature?}
+    DP -- ✅ Valid --> NI
+    NI -- yes --> NERR([501 NotImplemented<br/>XML + X-Tiny-S3 headers])
+    NI -- no --> E[Parse URI<br/>/bucket/key]
     E --> F{HTTP Method}
 
     F -- PUT<br/>no key --> G[createBucket<br/>mkdir STORAGE_ROOT/bucket]
@@ -49,13 +56,14 @@ flowchart TD
 
     F -- HEAD<br/>with key --> J[Resolve safe path<br/>check file exists]
 
-    F -- GET<br/>no key --> K[listBucket<br/>recursive filesystem scan]
+    F -- GET / --> R[listBuckets<br/>S3 service bucket listing]
+    F -- GET /bucket<br/>no key --> K[listBucket<br/>prefix/delimiter-aware scan]
     F -- GET<br/>with key --> L[downloadObject<br/>stream file content]
 
     F -- DELETE<br/>no key --> M[deleteBucket<br/>recursive remove]
     F -- DELETE<br/>with key --> N[deleteObject<br/>unlink file]
 
-    F -- other --> O([405 MethodNotAllowed])
+    F -- other --> O([501 NotImplemented])
 
     G --> OK([200 / 204 / XML Response])
     I --> OK
@@ -66,7 +74,7 @@ flowchart TD
     N --> OK
 ```
 
-### AWS Signature V4 Verification Flow
+### AWS Signature V4 Authorization Header Flow
 
 ```mermaid
 sequenceDiagram
@@ -92,6 +100,32 @@ sequenceDiagram
     end
 ```
 
+### AWS Signature V4 Presigned URL Flow
+
+```mermaid
+sequenceDiagram
+    participant G as URL Generator
+    participant C as Guest / Client
+    participant S as Tiny S3 index.php
+
+    G->>G: Build canonical request with X-Amz-* query parameters
+    G->>G: Sign URL with ACCESS_KEY + SECRET_KEY
+    G-->>C: https://host/bucket/key?X-Amz-Algorithm=...&X-Amz-Signature=...
+
+    C->>S: GET / PUT / HEAD / DELETE using the presigned URL
+    S->>S: Parse X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders
+    S->>S: Reject expired URLs
+    S->>S: Rebuild canonical query string without X-Amz-Signature
+    S->>S: Recalculate signature with getSigningKey(date, region, s3)
+
+    alt Signature valid and not expired
+        S->>S: Route to the normal bucket/object handler
+        S-->>C: 200 / 204 + XML or object stream
+    else Expired or invalid
+        S-->>C: 403 AccessDenied / SignatureDoesNotMatch
+    end
+```
+
 ### Filesystem Layout
 
 ```mermaid
@@ -109,23 +143,27 @@ graph TD
     classDef file fill:#f0fdf4,stroke:#22c55e,color:#14532d
 ```
 
-Each **bucket** is a directory. Each **object key** maps directly to a file path. Keys containing `/` create subdirectories automatically on upload.
+Each **bucket** is a directory. Each **object key** maps directly to a file path. Keys containing `/` create subdirectories automatically on upload. Zero-byte folder markers sent by GUI clients, for example `PUT /bucket/uploads/`, are stored as real directories so nested uploads such as `uploads/people/photo.jpg` work correctly on a filesystem-backed store.
 
 ---
 
 ## Supported Operations
 
-| Method | URL pattern | Operation | Success code |
-|---|---|---|---:|
-| `PUT` | `/bucket` | Create bucket | `200` |
-| `PUT` | `/bucket/key` | Upload object | `200` |
-| `GET` | `/bucket` | List bucket objects | `200` |
-| `GET` | `/bucket/key` | Download object | `200` |
-| `HEAD` | `/bucket/key` | Check object existence | `200` / `404` |
-| `DELETE` | `/bucket` | Delete bucket recursively | `204` |
-| `DELETE` | `/bucket/key` | Delete object | `204` |
-| `GET` | `/healthz` | Runtime healthcheck | `200` |
-| `GET` | `/__diag?token=SECRET_KEY` | Diagnostic report | `200` |
+| Method | URL pattern | Operation | Auth modes | Success code |
+|---|---|---|---|---:|
+| `PUT` | `/bucket` | Create bucket | Header / presigned URL | `200` |
+| `PUT` | `/bucket/key` | Upload object | Header / presigned URL | `200` |
+| `GET` | `/` | List all buckets using the S3 `ListAllMyBucketsResult` XML shape | Header / presigned URL | `200` |
+| `GET` | `/bucket` | List bucket objects, including `prefix`, `delimiter`, `max-keys`, and basic `list-type=2` | Header / presigned URL | `200` |
+| `GET` | `/bucket?location` | Return bucket region using the S3 `LocationConstraint` XML shape | Header / presigned URL | `200` |
+| `GET` | `/bucket?uploads` | Return an empty multipart upload listing for client compatibility | Header / presigned URL | `200` |
+| `GET` | `/bucket?versioning` | Return an empty versioning configuration, meaning versioning is disabled | Header / presigned URL | `200` |
+| `GET` | `/bucket/key` | Download object | Header / presigned URL | `200` |
+| `HEAD` | `/bucket/key` | Check object existence | Header / presigned URL | `200` / `404` |
+| `DELETE` | `/bucket` | Delete bucket recursively | Header / presigned URL | `204` |
+| `DELETE` | `/bucket/key` | Delete object | Header / presigned URL | `204` |
+| `GET` | `/healthz` | Runtime healthcheck | None | `200` |
+| `GET` | `/__diag?token=SECRET_KEY` | Diagnostic report | Token | `200` |
 
 ---
 
@@ -135,15 +173,39 @@ Tiny S3 intentionally implements only the basic S3 subset needed by many applica
 
 It does **not** currently implement:
 
-- Multipart upload API.
+- Multipart upload API for actual upload/create/complete/part operations. `GET ?uploads` returns an empty official-compatible listing so GUI clients can browse normally.
 - Bucket policies.
 - ACLs.
-- Object versioning.
+- Object tagging.
+- Object versioning storage/history. `GET ?versioning` returns an empty official-compatible configuration so GUI clients and SDKs can continue browsing.
 - S3 event notifications.
 - Server-side encryption metadata compatibility.
+- Full ListObjectsV2 pagination with continuation tokens.
 - Real AWS IAM semantics.
 
 Use it when you need a compact S3-compatible storage endpoint, not a full AWS S3 clone.
+
+### Unsupported feature notification
+
+When a client requests a known S3 feature that Tiny S3 does not implement, Tiny S3 now answers explicitly instead of failing silently. The response is:
+
+- HTTP `501 NotImplemented`.
+- XML error body with `<Code>NotImplemented</Code>`.
+- `X-Tiny-S3-Not-Implemented` response header describing the unsupported feature.
+- `X-Tiny-S3-Supported-Operations` response header listing the supported subset.
+
+Examples that intentionally return `501 NotImplemented`:
+
+Note: `GET /bucket?uploads` and `GET /bucket?versioning` are handled as official-compatible read/probe responses, but multipart upload creation/completion and real object version history remain unsupported.
+
+```text
+POST /bucket/key
+PUT /bucket/key?acl
+POST /bucket/key?uploads
+PUT /bucket/key?partNumber=1&uploadId=...
+```
+
+This is useful for guests, SDKs, and integration tests because the caller receives a clear answer: the endpoint is alive, the request was understood, but that S3 feature is outside the supported Tiny S3 subset.
 
 ---
 
@@ -151,8 +213,10 @@ Use it when you need a compact S3-compatible storage endpoint, not a full AWS S3
 
 Configuration can be provided in two ways:
 
-1. A local `.env` file next to `index.php`.
-2. Real environment variables, especially when running with Docker or Docker Compose.
+1. Real environment variables, especially when running with Docker or Docker Compose.
+2. A local `.env` file next to `index.php`.
+
+When the same variable exists in both places, the real environment variable wins. This is important for containers and CI/CD because injected secrets must override local defaults.
 
 Start from the template:
 
@@ -396,12 +460,12 @@ ports:
   - "127.0.0.1:9000:8080"
 ```
 
-Example Nginx site for `api.storage.flisol.app`:
+Example Nginx site for `api.test.org`:
 
 ```nginx
 server {
     listen 80;
-    server_name api.storage.flisol.app;
+    server_name api.test.org;
 
     client_max_body_size 0;
 
@@ -426,7 +490,7 @@ server {
 After enabling HTTPS with Certbot, use your normal certificate workflow, for example:
 
 ```bash
-sudo certbot --nginx -d api.storage.flisol.app
+sudo certbot --nginx -d api.test.org
 ```
 
 ---
@@ -472,7 +536,7 @@ Nginx server block:
 ```nginx
 server {
     listen 80;
-    server_name api.storage.flisol.app;
+    server_name api.test.org;
 
     root /var/www/tiny-s3;
     index index.php;
@@ -530,7 +594,7 @@ Apache virtual host:
 
 ```apacheconf
 <VirtualHost *:80>
-    ServerName api.storage.flisol.app
+    ServerName api.test.org
     DocumentRoot /var/www/tiny-s3
 
     <Directory /var/www/tiny-s3>
@@ -554,6 +618,87 @@ sudo systemctl reload apache2
 ```
 
 The included `.htaccess` routes all requests to `index.php` and forwards the `Authorization` header to PHP. This is required because S3 clients sign requests using that header.
+
+---
+
+## Presigned URLs
+
+Tiny S3 supports AWS Signature V4 presigned URLs for the same minimal operations supported by normal signed requests:
+
+- Presigned `GET /bucket/key` to download an object.
+- Presigned `PUT /bucket/key` to upload an object.
+- Presigned `HEAD /bucket/key` to check object existence.
+- Presigned `DELETE /bucket/key` to delete an object.
+- Presigned bucket operations such as `PUT /bucket` and `GET /bucket`.
+
+The following query parameters are validated:
+
+```text
+X-Amz-Algorithm=AWS4-HMAC-SHA256
+X-Amz-Credential=ACCESS_KEY/YYYYMMDD/REGION/s3/aws4_request
+X-Amz-Date=YYYYMMDDTHHMMSSZ
+X-Amz-Expires=seconds
+X-Amz-SignedHeaders=host
+X-Amz-Signature=hex-signature
+```
+
+`X-Amz-Expires` must be between `1` and `604800` seconds, matching the normal AWS Signature V4 maximum of seven days. Expired URLs return `403 AccessDenied`. Invalid signatures return `403 SignatureDoesNotMatch`.
+
+### Generate a presigned GET URL with boto3
+
+```python
+import boto3
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://localhost:9000",
+    aws_access_key_id="change-me-access-key",
+    aws_secret_access_key="change-me-secret-key",
+    region_name="us-east-1",
+)
+
+url = s3.generate_presigned_url(
+    ClientMethod="get_object",
+    Params={"Bucket": "my-bucket", "Key": "file.txt"},
+    ExpiresIn=300,
+)
+
+print(url)
+```
+
+Use it without AWS credentials on the guest/client side:
+
+```bash
+curl -L "$PRESIGNED_URL" -o file.txt
+```
+
+### Generate a presigned PUT URL with boto3
+
+```python
+url = s3.generate_presigned_url(
+    ClientMethod="put_object",
+    Params={"Bucket": "my-bucket", "Key": "upload.txt"},
+    ExpiresIn=300,
+)
+
+print(url)
+```
+
+Upload with curl:
+
+```bash
+curl -X PUT --data-binary @upload.txt "$PRESIGNED_URL"
+```
+
+### Production endpoint example
+
+When Tiny S3 is running behind HTTPS at `api.test.org`, configure the generator with:
+
+```python
+endpoint_url="https://api.test.org"
+```
+
+The guest only needs the generated URL. It does not need `ACCESS_KEY` or `SECRET_KEY`.
 
 ---
 
@@ -583,7 +728,14 @@ aws s3 cp file.txt s3://my-bucket/file.txt \
   --endpoint-url http://localhost:9000
 ```
 
-List:
+List buckets:
+
+```bash
+aws s3 ls \
+  --endpoint-url http://localhost:9000
+```
+
+List objects in a bucket:
 
 ```bash
 aws s3 ls s3://my-bucket \
@@ -608,8 +760,20 @@ For production HTTPS:
 
 ```bash
 aws s3 ls s3://my-bucket \
-  --endpoint-url https://api.storage.flisol.app
+  --endpoint-url https://api.test.org
 ```
+
+### Cyberduck / GUI clients
+
+Tiny S3 accepts the common probes issued by Cyberduck while browsing buckets:
+
+- `GET /` lists buckets.
+- `GET /bucket?location` returns the configured region.
+- `GET /bucket?uploads` returns an empty multipart upload list.
+- `GET /bucket?versioning` returns versioning disabled.
+- `PUT /bucket/folder/` creates a folder marker as a directory.
+
+For normal uploads, prefer single-part uploads. Tiny S3 does not yet implement the multipart upload create/part/complete workflow.
 
 ### boto3
 
@@ -707,6 +871,7 @@ The test suite uses PHPUnit and Guzzle only for development/testing. The runtime
 - Backup the storage directory regularly.
 - Do not commit `.env`.
 - Use reverse proxy upload streaming settings for large files.
+- Treat presigned URLs as bearer tokens: anyone with the URL can use it until it expires. Keep expiration short for public sharing.
 
 ---
 

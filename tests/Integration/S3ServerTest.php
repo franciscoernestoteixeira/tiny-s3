@@ -229,6 +229,23 @@ class S3ServerTest extends TestCase
         return static::$http->request($method, $path, $options);
     }
 
+
+    /**
+     * Send a request through a generated presigned URL.
+     */
+    private function presignedRequest(string $method, string $path, string $body = '')
+    {
+        $host = '127.0.0.1:' . static::$port;
+        $presignedPath = static::$signer->presign($method, $path, $host, 300);
+
+        $options = [];
+        if ($body !== '') {
+            $options['body'] = $body;
+        }
+
+        return static::$http->request($method, $presignedPath, $options);
+    }
+
     // -------------------------------------------------------------------------
     // Happy-path tests (ordered: create → upload → verify → download → delete)
     // -------------------------------------------------------------------------
@@ -304,6 +321,26 @@ class S3ServerTest extends TestCase
         $this->assertSame(self::OBJECT_BODY, (string) $response->getBody());
     }
 
+    public function testPresignedGetObjectReturnsUploadedContent(): void
+    {
+        $response = $this->presignedRequest('GET', '/' . self::BUCKET . '/' . self::OBJECT_KEY);
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame(self::OBJECT_BODY, (string) $response->getBody());
+    }
+
+    public function testPresignedPutObjectUploadsContent(): void
+    {
+        $key = 'presigned/upload.txt';
+        $body = 'Uploaded through a presigned URL';
+
+        $put = $this->presignedRequest('PUT', '/' . self::BUCKET . '/' . $key, $body);
+        $this->assertSame(200, $put->getStatusCode());
+
+        $get = $this->request('GET', '/' . self::BUCKET . '/' . $key);
+        $this->assertSame($body, (string) $get->getBody());
+    }
+
     public function testDeleteObjectReturns204(): void
     {
         $response = $this->request('DELETE', '/' . self::BUCKET . '/' . self::OBJECT_KEY);
@@ -368,12 +405,13 @@ class S3ServerTest extends TestCase
         $this->request('DELETE', '/' . $bucket);
     }
 
-    public function testUnsupportedMethodReturns405(): void
+    public function testUnsupportedMethodReturns501(): void
     {
         $response = $this->request('PATCH', '/any-bucket');
 
-        $this->assertSame(405, $response->getStatusCode());
-        $this->assertStringContainsString('MethodNotAllowed', (string) $response->getBody());
+        $this->assertSame(501, $response->getStatusCode());
+        $this->assertStringContainsString('NotImplemented', (string) $response->getBody());
+        $this->assertTrue($response->hasHeader('X-Tiny-S3-Not-Implemented'));
     }
 
     public function testInvalidSignatureReturns403(): void

@@ -198,6 +198,29 @@ function sendError(int $httpCode, string $code, string $message): never
 }
 
 
+/**
+ * Emit an explicit NotImplemented response for S3 features outside Tiny S3's
+ * intentionally small compatibility surface.
+ *
+ * This is the user-facing notification mechanism for unsupported behaviour: the
+ * caller receives a 501 response, an S3-style XML error body, and response
+ * headers indicating what was rejected and which operations are currently
+ * supported.  It is more useful than silently ignoring an unsupported query
+ * parameter such as ?uploads or returning a generic 404.
+ */
+function sendNotImplemented(string $feature): never
+{
+    header('X-Tiny-S3-Not-Implemented: ' . $feature);
+    header('X-Tiny-S3-Supported-Operations: PUT bucket, PUT object, GET bucket, GET object, HEAD object, DELETE bucket, DELETE object, presigned GET/HEAD/PUT/DELETE');
+
+    sendError(
+        501,
+        'NotImplemented',
+        "Tiny S3 does not implement: {$feature}. Supported operations: create bucket, upload object, list bucket, download object, head object, delete object, delete bucket, and AWS Signature V4 presigned URLs."
+    );
+}
+
+
 // ================================================================================================
 // SECTION 4 — IP ALLOWLIST
 //
@@ -405,6 +428,28 @@ function parseAuthorization(string $header): array
 }
 
 /**
+ * Parse the X-Amz-Credential query value used by AWS SigV4 presigned URLs.
+ *
+ * The value arrives URL-decoded from parse_str(), for example:
+ *   access-key/20260523/us-east-1/s3/aws4_request
+ *
+ * @return array{AK:string,Date:string,Region:string,Signed:string,Sig:string}
+ */
+function parsePresignedCredential(array $query): array
+{
+    $credential = (string)($query['X-Amz-Credential'] ?? $query['x-amz-credential'] ?? '');
+    preg_match('/^([^\/]+)\/([\d]{8})\/([^\/]+)\/s3\/aws4_request$/', $credential, $c);
+
+    return [
+        'AK'     => $c[1] ?? '',
+        'Date'   => $c[2] ?? '',
+        'Region' => $c[3] ?? '',
+        'Signed' => (string)($query['X-Amz-SignedHeaders'] ?? $query['x-amz-signedheaders'] ?? ''),
+        'Sig'    => (string)($query['X-Amz-Signature'] ?? $query['x-amz-signature'] ?? ''),
+    ];
+}
+
+/**
  * Derive the AWS V4 signing key through the four-step HMAC chain:
  *   HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service), "aws4_request")
  *
@@ -422,16 +467,272 @@ function getSigningKey(string $date, string $region, string $service): string
 }
 
 /**
- * Validate the AWS Signature V4 Authorization header on the current request.
- * Exits with 403 on any mismatch.
- *
- * The region is read from the REGION environment variable (not hardcoded) so the server
- * can match whatever region string the client sends in its credential scope.
- *
- * Security failures (bad key, missing date, signature mismatch) are logged as ERROR.
- * Verbose internals (canonical request, string-to-sign, raw header values) are DEBUG only.
+ * Percent-encode according to AWS SigV4 query-string rules.
+ * PHP's rawurlencode() already uses RFC 3986 rules, including %20 for spaces.
  */
-function checkSignature(): void
+function awsPercentEncode(string $value): string
+{
+    return rawurlencode($value);
+}
+
+/**
+ * Build a canonical query string for AWS SigV4.
+ *
+ * This parser preserves repeated query parameters and excludes X-Amz-Signature
+ * when validating presigned URLs. parse_str() cannot be used here because it
+ * collapses repeated parameter names and changes their canonical representation.
+ */
+function buildCanonicalQueryString(string $rawQuery, bool $excludeSignature = false): string
+{
+    if ($rawQuery === '') {
+        return '';
+    }
+
+    $pairs = [];
+
+    foreach (explode('&', $rawQuery) as $part) {
+        if ($part === '') {
+            continue;
+        }
+
+        [$rawName, $rawValue] = array_pad(explode('=', $part, 2), 2, '');
+        $name  = rawurldecode(str_replace('+', ' ', $rawName));
+        $value = rawurldecode(str_replace('+', ' ', $rawValue));
+
+        if ($excludeSignature && strcasecmp($name, 'X-Amz-Signature') === 0) {
+            continue;
+        }
+
+        $pairs[] = [awsPercentEncode($name), awsPercentEncode($value)];
+    }
+
+    usort($pairs, static function (array $a, array $b): int {
+        return $a[0] === $b[0] ? strcmp($a[1], $b[1]) : strcmp($a[0], $b[0]);
+    });
+
+    return implode('&', array_map(static fn(array $p): string => $p[0] . '=' . $p[1], $pairs));
+}
+
+/**
+ * Read a request header by its lowercase HTTP name, accounting for PHP's SAPI variables.
+ */
+function requestHeader(string $headerName): string
+{
+    $headerName = strtolower($headerName);
+
+    return match ($headerName) {
+        'host'           => $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '',
+        'content-type'   => $_SERVER['CONTENT_TYPE'] ?? '',
+        'content-length' => $_SERVER['CONTENT_LENGTH'] ?? '',
+        default          => $_SERVER['HTTP_' . strtoupper(str_replace('-', '_', $headerName))] ?? '',
+    };
+}
+
+/**
+ * Build the canonical headers block for a semicolon-separated SignedHeaders value.
+ */
+function buildCanonicalHeaders(string $signedHeaders): string
+{
+    $headers = array_filter(array_map('trim', explode(';', strtolower($signedHeaders))));
+    sort($headers, SORT_STRING);
+
+    $canonical = '';
+    foreach ($headers as $headerName) {
+        $value = preg_replace('/\s+/', ' ', trim(requestHeader($headerName))) ?? '';
+        $canonical .= $headerName . ':' . $value . "
+";
+    }
+
+    return $canonical;
+}
+
+/**
+ * Return the normalized SignedHeaders string sorted in canonical order.
+ */
+function normalizeSignedHeaders(string $signedHeaders): string
+{
+    $headers = array_filter(array_map('trim', explode(';', strtolower($signedHeaders))));
+    sort($headers, SORT_STRING);
+
+    return implode(';', $headers);
+}
+
+
+/**
+ * Detect S3 subresources that Tiny S3 intentionally does not implement.
+ *
+ * Signed request query parameters are ignored here because they are part of the
+ * authentication mechanism, not requested S3 functionality. Response override
+ * parameters are also allowed for presigned download URLs; Tiny S3 currently
+ * ignores them but they do not change storage semantics.
+ */
+function notifyIfUnsupportedS3Feature(): void
+{
+    $rawQuery = $_SERVER['QUERY_STRING'] ?? '';
+    if ($rawQuery === '') {
+        return;
+    }
+
+    parse_str($rawQuery, $query);
+
+    $supportedPassThrough = [
+        'prefix', 'delimiter', 'marker', 'max-keys', 'encoding-type', 'list-type', 'continuation-token', 'start-after',
+        'uploads', 'location', 'versioning',
+        'response-content-type', 'response-content-language', 'response-expires',
+        'response-cache-control', 'response-content-disposition', 'response-content-encoding',
+    ];
+
+    $notImplemented = [
+        'uploadid'      => 'Multipart Upload API (?uploadId=...)',
+        'partnumber'    => 'Multipart Upload API (?partNumber=...)',
+        'acl'           => 'ACL API (?acl)',
+        'tagging'       => 'Object Tagging API (?tagging)',
+        'versions'      => 'Object Versions API (?versions)',
+        'policy'        => 'Bucket Policy API (?policy)',
+        'cors'          => 'Bucket CORS API (?cors)',
+        'lifecycle'     => 'Bucket Lifecycle API (?lifecycle)',
+        'website'       => 'Bucket Website API (?website)',
+        'notification'  => 'Bucket Notification API (?notification)',
+        'encryption'    => 'Server-side Encryption API (?encryption)',
+        'requestpayment'=> 'Requester Pays API (?requestPayment)',
+        'replication'   => 'Bucket Replication API (?replication)',
+        'accelerate'    => 'Transfer Acceleration API (?accelerate)',
+        'inventory'     => 'Bucket Inventory API (?inventory)',
+        'metrics'       => 'Bucket Metrics API (?metrics)',
+        'analytics'     => 'Bucket Analytics API (?analytics)',
+        'object-lock'   => 'Object Lock API (?object-lock)',
+        'legal-hold'    => 'Object Legal Hold API (?legal-hold)',
+        'retention'     => 'Object Retention API (?retention)',
+        'restore'       => 'Object Restore API (?restore)',
+        'select'        => 'S3 Select API (?select)',
+        'torrent'       => 'Torrent API (?torrent)',
+    ];
+
+    foreach ($query as $name => $_) {
+        $normalized = strtolower((string)$name);
+
+        if (str_starts_with($normalized, 'x-amz-') || in_array($normalized, $supportedPassThrough, true)) {
+            continue;
+        }
+
+        if (isset($notImplemented[$normalized])) {
+            sendNotImplemented($notImplemented[$normalized]);
+        }
+    }
+}
+
+
+/**
+ * Return true when the current query string contains a given S3 subresource.
+ *
+ * S3 clients commonly send subresources with an empty value, for example
+ * `?location=` or `?uploads=`. array_key_exists() is therefore required;
+ * isset() would fail for some parsed forms.
+ */
+function hasS3Subresource(array $query, string $name): bool
+{
+    foreach ($query as $key => $_) {
+        if (strcasecmp((string)$key, $name) === 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Return the configured S3 region using the GetBucketLocation XML shape.
+ *
+ * AWS returns an empty LocationConstraint for us-east-1. Most S3-compatible
+ * clients accept either an empty value or the configured region; Tiny S3 keeps
+ * the AWS-compatible empty value only for us-east-1.
+ */
+function getBucketLocation(string $bucketDir, string $bucket): void
+{
+    global $region;
+
+    if ($bucket === '' || !is_dir($bucketDir)) {
+        sendError(404, 'NoSuchBucket', "Bucket '$bucket' does not exist");
+    }
+
+    $location = ($region === 'us-east-1') ? '' : $region;
+
+    header('Content-Type: application/xml');
+    echo '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . htmlspecialchars($location, ENT_XML1 | ENT_QUOTES, 'UTF-8')
+        . '</LocationConstraint>';
+    writeLog('INFO', "LOCATION $bucket — region: " . ($location === '' ? 'us-east-1(empty)' : $location));
+}
+
+
+/**
+ * Return an empty bucket versioning configuration.
+ *
+ * Many S3 clients ask for ?versioning during navigation. Tiny S3 does not store
+ * object versions, so the compatible response is an empty VersioningConfiguration
+ * document, which means versioning is suspended/disabled.
+ */
+function getBucketVersioning(string $bucketDir, string $bucket): void
+{
+    if ($bucket === '' || !is_dir($bucketDir)) {
+        sendError(404, 'NoSuchBucket', "Bucket '$bucket' does not exist");
+    }
+
+    header('Content-Type: application/xml');
+    echo '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></VersioningConfiguration>';
+    writeLog('INFO', "VERSIONING $bucket — disabled");
+}
+
+/**
+ * Return an empty multipart upload listing.
+ *
+ * Tiny S3 does not implement multipart upload storage yet, but clients such as
+ * Cyberduck probe `?uploads` while browsing. Returning the official empty XML
+ * response is more compatible than failing navigation with 501.
+ */
+function listMultipartUploads(string $bucketDir, string $bucket): void
+{
+    if ($bucket !== '' && !is_dir($bucketDir)) {
+        sendError(404, 'NoSuchBucket', "Bucket '$bucket' does not exist");
+    }
+
+    header('Content-Type: application/xml');
+    echo '<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . xmlElement('Bucket', $bucket)
+        . xmlElement('KeyMarker', '')
+        . xmlElement('UploadIdMarker', '')
+        . xmlElement('NextKeyMarker', '')
+        . xmlElement('NextUploadIdMarker', '')
+        . xmlElement('MaxUploads', '1000')
+        . xmlElement('IsTruncated', 'false')
+        . '</ListMultipartUploadsResult>';
+    writeLog('INFO', "MULTIPART LIST $bucket — 0 upload(s) returned");
+}
+
+/**
+ * Validate freshness for a presigned URL.
+ */
+function validatePresignedExpiry(string $amzDate, int $expires): void
+{
+    if ($expires < 1 || $expires > 604800) {
+        sendError(403, 'AccessDenied', 'X-Amz-Expires must be between 1 and 604800 seconds');
+    }
+
+    $issuedAt = DateTimeImmutable::createFromFormat('Ymd\THis\Z', $amzDate, new DateTimeZone('UTC'));
+    if (!$issuedAt) {
+        sendError(403, 'AccessDenied', 'Invalid X-Amz-Date value');
+    }
+
+    $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    if ($now->getTimestamp() > ($issuedAt->getTimestamp() + $expires)) {
+        sendError(403, 'AccessDenied', 'Presigned URL has expired');
+    }
+}
+
+/**
+ * Build and verify a canonical request for Authorization-header based SigV4.
+ */
+function checkAuthorizationHeaderSignature(): void
 {
     $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
     writeLog('DEBUG', "Authorization header: $authHeader");
@@ -439,77 +740,58 @@ function checkSignature(): void
     $auth = parseAuthorization($authHeader);
     writeLog('DEBUG', "Parsed auth: " . json_encode($auth));
 
-    // --- 1. Access key check ---
     if ($auth['AK'] !== $GLOBALS['accessKey']) {
         writeLog('ERROR', "Access key mismatch — received '{$auth['AK']}'");
         sendError(403, 'AccessDenied', 'Invalid Access Key');
     }
 
-    // --- 2. Require x-amz-date header ---
+    if ($auth['Region'] !== $GLOBALS['region']) {
+        sendError(403, 'AuthorizationHeaderMalformed', 'The credential scope region does not match this server');
+    }
+
     $amzDate = $_SERVER['HTTP_X_AMZ_DATE'] ?? '';
     if (!$amzDate) {
         writeLog('ERROR', "Missing x-amz-date header");
         sendError(403, 'MissingDate', 'x-amz-date header is required');
     }
 
-    // --- 3. Build canonical request ---
     $method = $_SERVER['REQUEST_METHOD'];
-    $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+    $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
     $qs     = $_SERVER['QUERY_STRING'] ?? '';
 
-    // Sort query parameters lexicographically, as required by SigV4
-    $canonicalQueryString = '';
-    if ($qs) {
-        parse_str($qs, $queryParts);
-        ksort($queryParts);
-        $canonicalQueryString = http_build_query($queryParts, '', '&', PHP_QUERY_RFC3986);
-    }
+    $signedHeaders = normalizeSignedHeaders($auth['Signed']);
+    $canonicalHeaders = buildCanonicalHeaders($signedHeaders);
 
-    // Build canonical headers block from the list declared in SignedHeaders
-    $signedHeaders    = explode(';', $auth['Signed']);
-    $canonicalHeaders = '';
-
-    foreach ($signedHeaders as $headerName) {
-        $headerName = strtolower($headerName);
-        $val = match ($headerName) {
-            'host'                 => $_SERVER['HTTP_HOST']                  ?? $_SERVER['SERVER_NAME'],
-            'content-type'         => $_SERVER['CONTENT_TYPE']               ?? '',
-            'x-amz-date'           => $_SERVER['HTTP_X_AMZ_DATE']            ?? '',
-            'x-amz-content-sha256' => $_SERVER['HTTP_X_AMZ_CONTENT_SHA256']  ?? '',
-            default                => $_SERVER['HTTP_' . strtoupper(str_replace('-', '_', $headerName))] ?? '',
-        };
-        $canonicalHeaders .= $headerName . ':' . trim($val) . "\n";
-    }
-
-    // Use the pre-computed payload hash when provided, or hash the raw body
     $hashedPayload = $_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '';
     if (!$hashedPayload) {
         $hashedPayload = hash('sha256', file_get_contents('php://input'));
     }
 
-    $canonicalRequest =
-        $method . "\n" .
-        $path   . "\n" .
-        $canonicalQueryString . "\n" .
-        $canonicalHeaders     . "\n" .
-        $auth['Signed']       . "\n" .
-        $hashedPayload;
+    $canonicalRequest = implode("
+", [
+        $method,
+        $path,
+        buildCanonicalQueryString($qs, false),
+        $canonicalHeaders,
+        $signedHeaders,
+        $hashedPayload,
+    ]);
 
-    writeLog('DEBUG', "Canonical request:\n$canonicalRequest");
+    writeLog('DEBUG', "Canonical request:
+$canonicalRequest");
 
-    // --- 4. Build string-to-sign ---
-    $region = $GLOBALS['region'];
+    $stringToSign = implode("
+", [
+        'AWS4-HMAC-SHA256',
+        $amzDate,
+        $auth['Date'] . '/' . $GLOBALS['region'] . '/s3/aws4_request',
+        hash('sha256', $canonicalRequest),
+    ]);
 
-    $stringToSign =
-        "AWS4-HMAC-SHA256\n" .
-        $amzDate . "\n" .
-        $auth['Date'] . "/$region/s3/aws4_request\n" .
-        hash('sha256', $canonicalRequest);
+    writeLog('DEBUG', "String-to-sign:
+$stringToSign");
 
-    writeLog('DEBUG', "String-to-sign:\n$stringToSign");
-
-    // --- 5. Derive signing key and compare using timing-safe comparison ---
-    $signingKey    = getSigningKey($auth['Date'], $region, 's3');
+    $signingKey    = getSigningKey($auth['Date'], $GLOBALS['region'], 's3');
     $calculatedSig = hash_hmac('sha256', $stringToSign, $signingKey);
 
     writeLog('DEBUG', "Signature — calculated: $calculatedSig | received: {$auth['Sig']}");
@@ -519,8 +801,111 @@ function checkSignature(): void
         sendError(403, 'SignatureDoesNotMatch', 'The request signature does not match');
     }
 
-    writeLog('DEBUG', "Signature OK");
+    writeLog('DEBUG', 'Authorization header signature OK');
 }
+
+/**
+ * Validate an AWS Signature V4 presigned URL.
+ *
+ * Supported presigned operations are the same minimal object/bucket operations
+ * supported by the normal Authorization-header flow. The signature is carried in
+ * query parameters instead of the Authorization header.
+ */
+function checkPresignedUrlSignature(): void
+{
+    $rawQuery = $_SERVER['QUERY_STRING'] ?? '';
+    parse_str($rawQuery, $query);
+
+    $algorithm = (string)($query['X-Amz-Algorithm'] ?? $query['x-amz-algorithm'] ?? '');
+    if ($algorithm !== 'AWS4-HMAC-SHA256') {
+        sendError(403, 'AccessDenied', 'Unsupported or missing X-Amz-Algorithm');
+    }
+
+    foreach (['X-Amz-Credential', 'X-Amz-Date', 'X-Amz-Expires', 'X-Amz-SignedHeaders', 'X-Amz-Signature'] as $required) {
+        if (!array_key_exists($required, $query)) {
+            sendError(403, 'AccessDenied', "Missing presigned URL parameter: {$required}");
+        }
+    }
+
+    $auth = parsePresignedCredential($query);
+    writeLog('DEBUG', "Parsed presigned auth: " . json_encode($auth));
+
+    if ($auth['AK'] !== $GLOBALS['accessKey']) {
+        writeLog('ERROR', "Presigned access key mismatch — received '{$auth['AK']}'");
+        sendError(403, 'AccessDenied', 'Invalid Access Key');
+    }
+
+    if ($auth['Region'] !== $GLOBALS['region']) {
+        sendError(403, 'AuthorizationHeaderMalformed', 'The credential scope region does not match this server');
+    }
+
+    $amzDate = (string)$query['X-Amz-Date'];
+    validatePresignedExpiry($amzDate, (int)$query['X-Amz-Expires']);
+
+    $method = $_SERVER['REQUEST_METHOD'];
+    $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
+
+    $signedHeaders    = normalizeSignedHeaders($auth['Signed']);
+    $canonicalHeaders = buildCanonicalHeaders($signedHeaders);
+
+    // S3 presigned URLs normally use UNSIGNED-PAYLOAD. If a client sends an
+    // explicit X-Amz-Content-Sha256 query parameter, honour it for compatibility.
+    $payloadHash = (string)($query['X-Amz-Content-Sha256'] ?? $query['x-amz-content-sha256'] ?? 'UNSIGNED-PAYLOAD');
+
+    $canonicalRequest = implode("
+", [
+        $method,
+        $path,
+        buildCanonicalQueryString($rawQuery, true),
+        $canonicalHeaders,
+        $signedHeaders,
+        $payloadHash,
+    ]);
+
+    writeLog('DEBUG', "Presigned canonical request:
+$canonicalRequest");
+
+    $stringToSign = implode("
+", [
+        'AWS4-HMAC-SHA256',
+        $amzDate,
+        $auth['Date'] . '/' . $GLOBALS['region'] . '/s3/aws4_request',
+        hash('sha256', $canonicalRequest),
+    ]);
+
+    writeLog('DEBUG', "Presigned string-to-sign:
+$stringToSign");
+
+    $signingKey    = getSigningKey($auth['Date'], $GLOBALS['region'], 's3');
+    $calculatedSig = hash_hmac('sha256', $stringToSign, $signingKey);
+
+    writeLog('DEBUG', "Presigned signature — calculated: $calculatedSig | received: {$auth['Sig']}");
+
+    if (!hash_equals($calculatedSig, $auth['Sig'])) {
+        writeLog('ERROR', "Presigned signature mismatch — calculated: $calculatedSig | received: {$auth['Sig']}");
+        sendError(403, 'SignatureDoesNotMatch', 'The presigned URL signature does not match');
+    }
+
+    writeLog('DEBUG', 'Presigned URL signature OK');
+}
+
+/**
+ * Validate the current request using either Authorization-header SigV4 or
+ * query-string SigV4 presigned URL authentication.
+ */
+function checkSignature(): void
+{
+    $rawQuery = $_SERVER['QUERY_STRING'] ?? '';
+    parse_str($rawQuery, $query);
+
+    if (isset($query['X-Amz-Algorithm']) || isset($query['x-amz-algorithm'])) {
+        checkPresignedUrlSignature();
+        return;
+    }
+
+    checkAuthorizationHeaderSignature();
+}
+
 
 
 // ================================================================================================
@@ -585,6 +970,92 @@ function validateUploadKey(string $key, string $bucket): void
 }
 
 
+
+/**
+ * Ensure the filesystem parent path for an object key can exist.
+ *
+ * S3 has a flat namespace: an object named "uploads" and another object named
+ * "uploads/file.txt" may coexist. A plain filesystem cannot represent that
+ * directly because "uploads" cannot be both a file and a directory.
+ *
+ * Tiny S3 keeps the implementation minimal and favors the directory/prefix use
+ * case used by S3 GUI clients and SDK uploads. When a zero-byte placeholder file
+ * blocks an intermediate prefix, it is converted into a directory. This fixes
+ * uploads after clients create visual folders/prefix markers.
+ */
+function ensureObjectDirectory(string $bucketDir, string $key, string $bucket): string
+{
+    $trimmedKey = trim($key, '/');
+
+    if ($trimmedKey === '') {
+        return $bucketDir;
+    }
+
+    $isFolderMarker = str_ends_with($key, '/');
+    $parts = array_values(array_filter(explode('/', $trimmedKey), static fn(string $part): bool => $part !== ''));
+
+    // For normal objects, create all path components except the last file name.
+    // For folder markers, every component represents a directory.
+    $directoryParts = $isFolderMarker ? $parts : array_slice($parts, 0, -1);
+
+    $current = $bucketDir;
+    foreach ($directoryParts as $part) {
+        $current .= '/' . $part;
+
+        if (is_file($current)) {
+            if (filesize($current) === 0) {
+                if (!unlink($current)) {
+                    writeLog('ERROR', "Could not replace zero-byte prefix object with directory: $current");
+                    sendError(500, 'InternalError', 'Could not prepare object directory');
+                }
+                writeLog('INFO', "Converted zero-byte prefix object into directory: $current");
+            } else {
+                writeLog('ERROR', "Non-empty object blocks directory prefix: $current");
+                sendError(409, 'OperationAborted', 'A non-empty object already exists where a directory prefix is required');
+            }
+        }
+
+        if (!is_dir($current)) {
+            if (!mkdir($current, 0755, true) && !is_dir($current)) {
+                $error = error_get_last();
+                $message = $error['message'] ?? 'unknown mkdir error';
+                writeLog('ERROR', "mkdir failed for object directory: $current — $message");
+                sendError(500, 'InternalError', 'Could not create object directory');
+            }
+        }
+    }
+
+    return $isFolderMarker ? ($bucketDir . '/' . $trimmedKey) : dirname($bucketDir . '/' . $trimmedKey);
+}
+
+/**
+ * Create a zero-byte folder marker as a real directory.
+ *
+ * S3 itself has no real folders, but GUI clients such as Cyberduck create
+ * zero-byte objects with trailing "/" to represent folders. Representing those
+ * markers as directories keeps filesystem-backed listing and nested uploads
+ * working predictably.
+ */
+function createFolderMarker(string $bucketDir, string $key, string $bucket): void
+{
+    $folderPath = ensureObjectDirectory($bucketDir, $key, $bucket);
+
+    if (!is_dir($folderPath)) {
+        if (!mkdir($folderPath, 0755, true) && !is_dir($folderPath)) {
+            $error = error_get_last();
+            $message = $error['message'] ?? 'unknown mkdir error';
+            writeLog('ERROR', "mkdir failed for folder marker: $folderPath — $message");
+            sendError(500, 'InternalError', 'Could not create folder marker');
+        }
+    }
+
+    http_response_code(200);
+    header('ETag: "' . md5('') . '"');
+    header('Content-Type: application/xml');
+    writeLog('INFO', "Folder marker created: $bucket/$key");
+}
+
+
 // ================================================================================================
 // SECTION 7 — PUT: BUCKET CREATION & OBJECT UPLOAD
 // ================================================================================================
@@ -636,16 +1107,14 @@ function uploadObject(string $bucketDir, string $key, string $bucket): void
 {
     validateUploadKey($key, $bucket);
 
-    $fullPath = "$bucketDir/$key";
-    $dirPath  = dirname($fullPath);
-
-    // Auto-create intermediate directories for keys containing `/` path separators
-    if (!is_dir($dirPath)) {
-        if (!mkdir($dirPath, 0755, true)) {
-            writeLog('ERROR', "mkdir failed for object directory: $dirPath");
-            sendError(500, 'InternalError', 'Could not create object directory');
-        }
+    if (str_ends_with($key, '/')) {
+        createFolderMarker($bucketDir, $key, $bucket);
+        return;
     }
+
+    $safeKey = trim($key, '/');
+    $dirPath = ensureObjectDirectory($bucketDir, $safeKey, $bucket);
+    $fullPath = "$bucketDir/$safeKey";
 
     $out = fopen($fullPath, 'w');
     if ($out === false) {
@@ -765,6 +1234,29 @@ function handleHead(string $key, string $bucketDir, string $bucket): void
  */
 function handleGet(string $key, string $bucketDir, string $bucket): void
 {
+    $query = [];
+    parse_str($_SERVER['QUERY_STRING'] ?? '', $query);
+
+    if (hasS3Subresource($query, 'location')) {
+        getBucketLocation($bucketDir, $bucket);
+        return;
+    }
+
+    if (hasS3Subresource($query, 'uploads')) {
+        listMultipartUploads($bucketDir, $bucket);
+        return;
+    }
+
+    if (hasS3Subresource($query, 'versioning')) {
+        getBucketVersioning($bucketDir, $bucket);
+        return;
+    }
+
+    if ($bucket === '' && $key === '') {
+        listBuckets($bucketDir);
+        return;
+    }
+
     if ($key !== '') {
         downloadObject($bucketDir, $key, $bucket);
     } else {
@@ -790,6 +1282,49 @@ function downloadObject(string $bucketDir, string $key, string $bucket): void
     writeLog('INFO', "GET 200: $bucket/$key");
 }
 
+
+/**
+ * Return the service-level bucket list used by `GET /`.
+ *
+ * This follows the S3 ListBuckets response shape. Bucket directories are the
+ * source of truth; regular files placed directly under STORAGE_ROOT are ignored.
+ */
+function listBuckets(string $storageRoot): void
+{
+    if (!is_dir($storageRoot)) {
+        if (!mkdir($storageRoot, 0755, true)) {
+            writeLog('ERROR', "mkdir failed for storage root: $storageRoot");
+            sendError(500, 'InternalError', 'Could not create storage root directory');
+        }
+    }
+
+    $bucketNames = [];
+    foreach (array_diff(scandir($storageRoot), ['.', '..']) as $entry) {
+        $path = $storageRoot . '/' . $entry;
+        if (is_dir($path)) {
+            $bucketNames[] = $entry;
+        }
+    }
+
+    sort($bucketNames, SORT_STRING);
+
+    header('Content-Type: application/xml');
+    echo '<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
+    echo '<Owner>' . xmlElement('ID', 'tiny-s3') . xmlElement('DisplayName', 'tiny-s3') . '</Owner>';
+    echo '<Buckets>';
+
+    foreach ($bucketNames as $bucketName) {
+        $createdAt = gmdate('Y-m-d\TH:i:s.000\Z', filemtime($storageRoot . '/' . $bucketName) ?: time());
+        echo '<Bucket>'
+            . xmlElement('Name', $bucketName)
+            . xmlElement('CreationDate', $createdAt)
+            . '</Bucket>';
+    }
+
+    echo '</Buckets></ListAllMyBucketsResult>';
+    writeLog('INFO', 'LIST buckets — ' . count($bucketNames) . ' bucket(s) returned');
+}
+
 /**
  * Return an S3-compatible XML listing of all objects inside the bucket.
  * Keys containing `/` represent virtual sub-directories, matching standard S3 behaviour.
@@ -802,17 +1337,164 @@ function listBucket(string $bucketDir, string $bucket): void
         sendError(404, 'NoSuchBucket', "Bucket '$bucket' does not exist");
     }
 
-    $objects = listObjectsRecursively($bucketDir);
+    $query = [];
+    parse_str($_SERVER['QUERY_STRING'] ?? '', $query);
 
-    header('Content-Type: application/xml');
-    echo "<ListBucketResult>" . xmlElement('Name', $bucket);
-
-    foreach ($objects as $objectKey) {
-        echo "<Contents>" . xmlElement('Key', $objectKey) . "</Contents>";
+    if (($query['list-type'] ?? '') === '2') {
+        listBucketV2($bucketDir, $bucket, $query);
+        return;
     }
 
-    echo "</ListBucketResult>";
-    writeLog('INFO', "LIST $bucket — " . count($objects) . " object(s) returned");
+    $prefix = (string)($query['prefix'] ?? '');
+    $delimiter = (string)($query['delimiter'] ?? '');
+    $maxKeys = max(1, min(1000, (int)($query['max-keys'] ?? 1000)));
+
+    $listing = buildDelimitedListing(listObjectsRecursively($bucketDir), $prefix, $delimiter);
+    $combinedCount = count($listing['contents']) + count($listing['commonPrefixes']);
+    $isTruncated = $combinedCount > $maxKeys;
+
+    $remaining = $maxKeys;
+    $contents = array_slice($listing['contents'], 0, $remaining);
+    $remaining -= count($contents);
+    $commonPrefixes = $remaining > 0 ? array_slice($listing['commonPrefixes'], 0, $remaining) : [];
+
+    header('Content-Type: application/xml');
+    echo '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . xmlElement('Name', $bucket)
+        . xmlElement('Prefix', $prefix)
+        . xmlElement('Marker', (string)($query['marker'] ?? ''))
+        . xmlElement('MaxKeys', (string)$maxKeys)
+        . xmlElement('Delimiter', $delimiter)
+        . xmlElement('IsTruncated', $isTruncated ? 'true' : 'false');
+
+    foreach ($contents as $objectKey) {
+        $fullPath = $bucketDir . '/' . $objectKey;
+        echo '<Contents>'
+            . xmlElement('Key', $objectKey)
+            . xmlElement('LastModified', is_file($fullPath) ? gmdate('Y-m-d\TH:i:s.000\Z', filemtime($fullPath) ?: time()) : gmdate('Y-m-d\TH:i:s.000\Z'))
+            . xmlElement('ETag', is_file($fullPath) ? '"' . md5_file($fullPath) . '"' : '""')
+            . xmlElement('Size', is_file($fullPath) ? (string)filesize($fullPath) : '0')
+            . xmlElement('StorageClass', 'STANDARD')
+            . '</Contents>';
+    }
+
+    foreach ($commonPrefixes as $commonPrefix) {
+        echo '<CommonPrefixes>' . xmlElement('Prefix', $commonPrefix) . '</CommonPrefixes>';
+    }
+
+    echo '</ListBucketResult>';
+    writeLog('INFO', "LIST $bucket — " . count($contents) . " object(s), " . count($commonPrefixes) . " common prefix(es) returned");
+}
+
+/**
+ * Return a minimal ListObjectsV2-compatible XML response.
+ *
+ * This keeps common AWS SDK calls such as list_objects_v2() working while still
+ * avoiding the complexity of full continuation-token pagination. The response is
+ * deterministic, prefix-aware, and capped by max-keys.
+ */
+function listBucketV2(string $bucketDir, string $bucket, array $query): void
+{
+    $prefix  = (string)($query['prefix'] ?? '');
+    $delimiter = (string)($query['delimiter'] ?? '');
+    $maxKeys = max(1, min(1000, (int)($query['max-keys'] ?? 1000)));
+
+    $listing = buildDelimitedListing(listObjectsRecursively($bucketDir), $prefix, $delimiter);
+    $combinedCount = count($listing['contents']) + count($listing['commonPrefixes']);
+    $isTruncated = $combinedCount > $maxKeys;
+
+    $remaining = $maxKeys;
+    $contents = array_slice($listing['contents'], 0, $remaining);
+    $remaining -= count($contents);
+    $commonPrefixes = $remaining > 0 ? array_slice($listing['commonPrefixes'], 0, $remaining) : [];
+    $keyCount = count($contents) + count($commonPrefixes);
+
+    header('Content-Type: application/xml');
+    echo '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
+    echo xmlElement('Name', $bucket);
+    echo xmlElement('Prefix', $prefix);
+    echo xmlElement('KeyCount', (string)$keyCount);
+    echo xmlElement('MaxKeys', (string)$maxKeys);
+    echo xmlElement('Delimiter', $delimiter);
+    echo xmlElement('IsTruncated', $isTruncated ? 'true' : 'false');
+
+    foreach ($contents as $objectKey) {
+        $fullPath = $bucketDir . '/' . $objectKey;
+        echo '<Contents>'
+            . xmlElement('Key', $objectKey)
+            . xmlElement('LastModified', is_file($fullPath) ? gmdate('Y-m-d\TH:i:s.000\Z', filemtime($fullPath) ?: time()) : gmdate('Y-m-d\TH:i:s.000\Z'))
+            . xmlElement('ETag', is_file($fullPath) ? '"' . md5_file($fullPath) . '"' : '""')
+            . xmlElement('Size', is_file($fullPath) ? (string)filesize($fullPath) : '0')
+            . xmlElement('StorageClass', 'STANDARD')
+            . '</Contents>';
+    }
+
+    foreach ($commonPrefixes as $commonPrefix) {
+        echo '<CommonPrefixes>' . xmlElement('Prefix', $commonPrefix) . '</CommonPrefixes>';
+    }
+
+    echo '</ListBucketResult>';
+    writeLog('INFO', "LISTV2 $bucket — " . count($contents) . " object(s), " . count($commonPrefixes) . " common prefix(es) returned");
+}
+
+
+/**
+ * Build an S3 delimiter-aware object listing.
+ *
+ * Without a delimiter, all matching keys are returned as Contents. With a
+ * delimiter, keys containing the delimiter after the requested prefix are grouped
+ * into CommonPrefixes, which is what GUI clients use to render folders.
+ *
+ * @param string[] $objects Ordered bucket-relative object keys
+ * @return array{contents:string[], commonPrefixes:string[]}
+ */
+function buildDelimitedListing(array $objects, string $prefix, string $delimiter): array
+{
+    $contents = [];
+    $commonPrefixes = [];
+
+    foreach (filterListedObjects($objects, $prefix) as $objectKey) {
+        if ($delimiter !== '') {
+            $remaining = substr($objectKey, strlen($prefix));
+            $delimiterPosition = strpos($remaining, $delimiter);
+
+            if ($delimiterPosition !== false) {
+                $commonPrefix = $prefix . substr($remaining, 0, $delimiterPosition + strlen($delimiter));
+                $commonPrefixes[$commonPrefix] = true;
+                continue;
+            }
+        }
+
+        $contents[] = $objectKey;
+    }
+
+    $prefixes = array_keys($commonPrefixes);
+    sort($prefixes, SORT_STRING);
+
+    return [
+        'contents' => $contents,
+        'commonPrefixes' => $prefixes,
+    ];
+}
+
+/**
+ * Apply a simple S3 prefix filter to an ordered list of keys.
+ *
+ * @param string[] $objects
+ * @return string[]
+ */
+function filterListedObjects(array $objects, string $prefix): array
+{
+    sort($objects, SORT_STRING);
+
+    if ($prefix === '') {
+        return array_values($objects);
+    }
+
+    return array_values(array_filter(
+        $objects,
+        static fn(string $key): bool => str_starts_with($key, $prefix)
+    ));
 }
 
 /**
@@ -832,7 +1514,11 @@ function listObjectsRecursively(string $dir, string $prefix = ''): array
         $objectKey = $prefix . $item;
 
         if (is_dir($fullPath)) {
-            // Recurse with trailing `/` to reflect S3's virtual directory convention
+            // Include the directory itself as a folder-marker key so empty
+            // folders created by GUI clients appear in delimiter listings.
+            $result[] = $objectKey . '/';
+
+            // Recurse with trailing `/` to reflect S3's virtual directory convention.
             $result = array_merge($result, listObjectsRecursively($fullPath, $objectKey . '/'));
         } else {
             $result[] = $objectKey;
@@ -942,22 +1628,22 @@ loadEnv(__DIR__ . '/.env');
 // came from a .env file (loaded above into $_ENV) or were injected directly by the parent
 // process (e.g. the integration test suite via proc_open).  Checking $_ENV first preserves
 // the .env-file path; getenv() is the fallback for the process-environment path.
-$debug      = envToBool($_ENV['DEBUG']       ?? getenv('DEBUG')       ?: 'false');  // string fallback required — see envToBool()
-$accessKey  = $_ENV['ACCESS_KEY']            ?? getenv('ACCESS_KEY')  ?: '';
-$secretKey  = $_ENV['SECRET_KEY']            ?? getenv('SECRET_KEY')  ?: '';
-$region     = $_ENV['REGION']                ?? getenv('REGION')      ?: 'us-east-1';  // must match the region string the client sends
-$allowedIps = $_ENV['ALLOWED_IPS']           ?? getenv('ALLOWED_IPS') ?: '';          // empty / "*" = open to all
+$debug      = envToBool(getenv('DEBUG')       ?: ($_ENV['DEBUG']       ?? 'false'));  // string fallback required — see envToBool()
+$accessKey  = getenv('ACCESS_KEY')           ?: ($_ENV['ACCESS_KEY']  ?? '');
+$secretKey  = getenv('SECRET_KEY')           ?: ($_ENV['SECRET_KEY']  ?? '');
+$region     = getenv('REGION')               ?: ($_ENV['REGION']      ?? 'us-east-1');  // must match the region string the client sends
+$allowedIps = getenv('ALLOWED_IPS')          ?: ($_ENV['ALLOWED_IPS'] ?? '');          // empty / "*" = open to all
 
 // STORAGE_ROOT and LOG_FILE may be absolute paths (e.g. an integration test injecting
 // a temp directory) or relative paths anchored to the project root (the normal .env case).
 // An absolute path starts with a Unix root ('/'), a Windows drive letter ('C:\' or 'C:/'),
 // or a UNC path ('\\').  Everything else is treated as relative to __DIR__.
-$storageRootRaw = $_ENV['STORAGE_ROOT'] ?? getenv('STORAGE_ROOT') ?: '../data';
+$storageRootRaw = getenv('STORAGE_ROOT') ?: ($_ENV['STORAGE_ROOT'] ?? '../data');
 $storageRoot    = preg_match('/^([A-Za-z]:[\\\\\/]|\/|\\\\\\\\)/', $storageRootRaw)
     ? rtrim($storageRootRaw, '/\\')
     : __DIR__ . '/' . $storageRootRaw;
 
-$logFileRaw = $_ENV['LOG_FILE'] ?? getenv('LOG_FILE') ?: 'activities.log';
+$logFileRaw = getenv('LOG_FILE') ?: ($_ENV['LOG_FILE'] ?? 'activities.log');
 $logFile    = preg_match('/^([A-Za-z]:[\\\\\/]|\/|\\\\\\\\)/', $logFileRaw)
     ? $logFileRaw
     : __DIR__ . '/' . $logFileRaw;
@@ -1072,6 +1758,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
 
 checkIpAllowlist();
 checkSignature();
+notifyIfUnsupportedS3Feature();
 
 $uriPath   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $uriParts  = explode('/', trim($uriPath, '/'), 2);
@@ -1088,7 +1775,7 @@ match ($method) {
     'HEAD'   => handleHead($key, $bucketDir, $bucket),
     'GET'    => handleGet($key, $bucketDir, $bucket),
     'DELETE' => handleDelete($bucket, $key, $bucketDir),
-    default  => sendError(405, 'MethodNotAllowed', "HTTP method '$method' is not supported"),
+    default  => sendNotImplemented("HTTP method '$method'"),
 };
 
 } // end if (!defined('TINY_S3_TEST'))
