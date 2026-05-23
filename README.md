@@ -1,82 +1,98 @@
 # Tiny S3
 
-A minimal **AWS S3-compatible storage server** written in a single PHP file.  
-It implements AWS Signature V4 authentication and supports the core S3 operations — enough to work with clients like `rclone`, `boto3`, and the AWS CLI.
+Tiny S3 is a minimal **AWS S3-compatible storage emulator** written in pure PHP.
 
-All objects are stored as plain files on the local filesystem, with no database and no external dependencies.
+It is designed for small production deployments, internal systems, development environments, and integration tests where a lightweight S3-compatible endpoint is useful without running MinIO, Garage, Ceph, or cloud object storage.
+
+Objects are stored as plain files on the local filesystem. Buckets are directories. Object keys are file paths inside each bucket.
 
 ---
 
-## How It Works
+## Main Goals
+
+- Minimal functional S3-compatible server.
+- Single PHP application entry point: `index.php`.
+- No database.
+- No mandatory Composer dependencies for runtime.
+- AWS Signature V4 verification.
+- Local filesystem storage.
+- Docker-ready runtime using **PHP 8.5 + PHP-FPM + Nginx**.
+- Easy deployment to a VPS using either Docker, Nginx, or Apache.
+
+---
+
+
+## Architecture and Flows
+
+The diagrams below describe the runtime flow, AWS Signature V4 validation, and the local filesystem mapping used by Tiny S3.
+
+### Request Lifecycle
 
 ```mermaid
 flowchart TD
-    A([Incoming HTTP Request]) --> B[Load .env\nParse config]
-    B --> C{Signature V4\ncheckSignature}
+    A([Incoming HTTP Request]) --> B[Load configuration<br/>.env + environment variables]
+    B --> C{Utility endpoint?}
 
-    C -- ❌ 403 AccessDenied --> ERR([XML Error Response])
-    C -- ❌ 403 MissingDate --> ERR
-    C -- ❌ 403 SignatureDoesNotMatch --> ERR
+    C -- GET /healthz --> HZ([200 OK])
+    C -- GET /__diag<br/>token required --> DG([Diagnostic XML/JSON response])
+    C -- No --> D{AWS Signature V4<br/>checkSignature}
 
-    C -- ✅ Valid --> D[Parse URI\n/bucket/key]
-    D --> E{HTTP Method}
+    D -- ❌ 403 AccessDenied --> ERR([XML Error Response])
+    D -- ❌ 403 MissingDate --> ERR
+    D -- ❌ 403 SignatureDoesNotMatch --> ERR
 
-    E -- PUT\nno key --> F[createBucket\nmkdir STORAGE_ROOT/bucket]
-    E -- PUT\nwith key --> G[uploadObject\nnormal or aws-chunked]
+    D -- ✅ Valid --> E[Parse URI<br/>/bucket/key]
+    E --> F{HTTP Method}
 
-    E -- HEAD\nwith key --> H[Resolve realpath\ncheck file exists]
+    F -- PUT<br/>no key --> G[createBucket<br/>mkdir STORAGE_ROOT/bucket]
+    F -- PUT<br/>with key --> I[uploadObject<br/>normal payload or aws-chunked stream]
 
-    E -- GET\nno key --> I[listBucket\nrecursive scandir]
-    E -- GET\nwith key --> J[resolveSafePath\ndownloadObject → readfile]
+    F -- HEAD<br/>with key --> J[Resolve safe path<br/>check file exists]
 
-    E -- DELETE\nno key --> K[deleteBucket\nrecursive rmdir]
-    E -- DELETE\nwith key --> L[resolveSafePath\ndeleteObject → unlink]
+    F -- GET<br/>no key --> K[listBucket<br/>recursive filesystem scan]
+    F -- GET<br/>with key --> L[downloadObject<br/>stream file content]
 
-    E -- other --> M([405 MethodNotAllowed])
+    F -- DELETE<br/>no key --> M[deleteBucket<br/>recursive remove]
+    F -- DELETE<br/>with key --> N[deleteObject<br/>unlink file]
 
-    F --> OK([200 / 204 / XML Response])
-    G --> OK
-    H --> OK
+    F -- other --> O([405 MethodNotAllowed])
+
+    G --> OK([200 / 204 / XML Response])
     I --> OK
     J --> OK
     K --> OK
     L --> OK
+    M --> OK
+    N --> OK
 ```
 
----
-
-## AWS Signature V4 Verification Flow
+### AWS Signature V4 Verification Flow
 
 ```mermaid
 sequenceDiagram
     participant C as S3 Client
-    participant S as Tiny S3 (index.php)
+    participant S as Tiny S3 index.php
 
     C->>S: HTTP Request + Authorization header
 
-    S->>S: parseAuthorization(header)<br/>Extract: access key, date, region,<br/>signed headers, signature
-
+    S->>S: parseAuthorization(header)
+    S->>S: Extract access key, date, region, signed headers, signature
     S->>S: Validate ACCESS_KEY
 
-    S->>S: Build canonical request<br/>(method, path, sorted query, headers, payload hash)
-
+    S->>S: Build canonical request<br/>method, path, sorted query, headers, payload hash
     S->>S: Build string-to-sign<br/>AWS4-HMAC-SHA256 + date + region scope + hash
-
-    S->>S: getSigningKey(date, region, "s3")<br/>HMAC chain: date → region → service → aws4_request
-
+    S->>S: getSigningKey(date, region, s3)<br/>HMAC chain: date -> region -> service -> aws4_request
     S->>S: hash_equals(calculated, received)
 
     alt Signature valid
-        S->>S: Route to method handler
-        S-->>C: 200 / 204 + XML body
+        S->>S: Route to bucket/object handler
+        S-->>C: 200 / 204 + XML or object stream
     else Signature invalid
         S-->>C: 403 SignatureDoesNotMatch
     end
 ```
 
----
-
-## Filesystem Layout
+### Filesystem Layout
 
 ```mermaid
 graph TD
@@ -85,7 +101,7 @@ graph TD
     R --> B2["backups/"]:::dir
     B1 --> F1["photo.jpg"]:::file
     B1 --> F2["report.pdf"]:::file
-    B1 --> SD["2024/"]:::dir
+    B1 --> SD["2026/"]:::dir
     SD --> F3["january.csv"]:::file
     B2 --> F4["db.sql.gz"]:::file
 
@@ -99,99 +115,445 @@ Each **bucket** is a directory. Each **object key** maps directly to a file path
 
 ## Supported Operations
 
-| Method | URL pattern        | Operation              | Success code |
-|--------|--------------------|------------------------|:------------:|
-| `PUT`  | `/bucket`          | Create bucket          | 200          |
-| `PUT`  | `/bucket/key`      | Upload object          | 200 + ETag   |
-| `GET`  | `/bucket`          | List objects in bucket | 200 XML      |
-| `GET`  | `/bucket/key`      | Download object        | 200 stream   |
-| `HEAD` | `/bucket/key`      | Check object exists    | 200 / 404    |
-| `DELETE` | `/bucket`        | Delete bucket (recursive) | 204       |
-| `DELETE` | `/bucket/key`    | Delete object          | 204          |
+| Method | URL pattern | Operation | Success code |
+|---|---|---|---:|
+| `PUT` | `/bucket` | Create bucket | `200` |
+| `PUT` | `/bucket/key` | Upload object | `200` |
+| `GET` | `/bucket` | List bucket objects | `200` |
+| `GET` | `/bucket/key` | Download object | `200` |
+| `HEAD` | `/bucket/key` | Check object existence | `200` / `404` |
+| `DELETE` | `/bucket` | Delete bucket recursively | `204` |
+| `DELETE` | `/bucket/key` | Delete object | `204` |
+| `GET` | `/healthz` | Runtime healthcheck | `200` |
+| `GET` | `/__diag?token=SECRET_KEY` | Diagnostic report | `200` |
 
 ---
 
-## Setup
+## Current Limitations
 
-### Requirements
+Tiny S3 intentionally implements only the basic S3 subset needed by many applications.
 
-- PHP 8.1 or later (uses `match`, `str_starts_with`, `never` return type)
-- A web server that routes all requests to `index.php` (Apache, Nginx, Caddy, or PHP built-in)
+It does **not** currently implement:
 
-### Installation
+- Multipart upload API.
+- Bucket policies.
+- ACLs.
+- Object versioning.
+- S3 event notifications.
+- Server-side encryption metadata compatibility.
+- Real AWS IAM semantics.
 
-```bash
-# 1. Clone or copy index.php to your web root
-git clone https://github.com/franciscoteixeira/tiny-s3.git /var/www/tiny-s3
-cd /var/www/tiny-s3
-
-# 2. Install dev dependencies (PHPUnit + Guzzle — skip if you don't need tests)
-composer install
-
-# 3. Create your .env file from the template
-cp .env.template .env
-nano .env   # fill in ACCESS_KEY, SECRET_KEY, etc.
-
-# 4. Create the storage directory (parent of STORAGE_ROOT)
-mkdir -p /var/www/data
-chown www-data:www-data /var/www/data
-
-# 5. The log file is created automatically on first startup.
-#    Ensure the web server user can write to the project directory, or set
-#    LOG_FILE to an absolute path the server can write to (e.g. /var/log/tiny-s3.log).
-```
-
-### Apache — route all requests to index.php
-
-```apacheconf
-# .htaccess
-RewriteEngine On
-RewriteCond %{REQUEST_FILENAME} !-f
-RewriteRule ^ index.php [QSA,L]
-```
-
-### Nginx
-
-```nginx
-location / {
-    try_files $uri $uri/ /index.php$is_args$args;
-}
-location ~ \.php$ {
-    fastcgi_pass unix:/run/php/php8.2-fpm.sock;
-    include fastcgi_params;
-    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-}
-```
-
-### PHP built-in server (development only)
-
-```bash
-composer start
-```
-
-This runs `php -S localhost:9000 index.php`. To bind to all interfaces instead
-(e.g. to reach the server from another machine on the same network):
-
-```bash
-php -S 0.0.0.0:9000 index.php
-```
+Use it when you need a compact S3-compatible storage endpoint, not a full AWS S3 clone.
 
 ---
 
 ## Configuration
 
-All configuration is read from the `.env` file in the same directory as `index.php`.  
-See `.env.template` for full documentation of every variable.
+Configuration can be provided in two ways:
 
-| Variable       | Default          | Description |
-|----------------|------------------|-------------|
-| `DEBUG`        | `false`          | Append detailed request logs to `LOG_FILE` |
-| `ACCESS_KEY`   | *(required)*     | Client-facing access key ID |
-| `SECRET_KEY`   | *(required)*     | Secret used to verify HMAC-SHA256 signatures |
-| `REGION`       | `us-east-1`      | Region string in the Signature V4 credential scope |
-| `ALLOWED_IPS`  | *(empty)*        | Comma/space-separated IPs and CIDR ranges allowed to connect; empty or `*` disables the check |
-| `STORAGE_ROOT` | `../data`        | Root directory for buckets and objects |
-| `LOG_FILE`     | `activities.log` | Log file path (relative to `index.php`); created automatically at startup |
+1. A local `.env` file next to `index.php`.
+2. Real environment variables, especially when running with Docker or Docker Compose.
+
+Start from the template:
+
+```bash
+cp .env.template .env
+nano .env
+```
+
+### Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEBUG` | `false` | Enables verbose request/signature logs. Keep `false` in production. |
+| `ACCESS_KEY` | required | S3 access key used by clients. |
+| `SECRET_KEY` | required | Secret used to verify AWS Signature V4 requests. |
+| `REGION` | `us-east-1` | Region expected in the Signature V4 credential scope. |
+| `ALLOWED_IPS` | empty | Optional comma/space-separated IP or CIDR allowlist. Empty or `*` allows all. |
+| `STORAGE_ROOT` | `./data` or Docker `/var/lib/tiny-s3` | Root directory where buckets and objects are stored. |
+| `LOG_FILE` | `activities.log` or Docker `/var/log/tiny-s3/activities.log` | Activity log file. Errors and warnings are always logged. |
+
+Generate credentials:
+
+```bash
+openssl rand -hex 20
+openssl rand -base64 32
+```
+
+Example `.env`:
+
+```dotenv
+DEBUG=false
+ACCESS_KEY=change-me-access-key
+SECRET_KEY=change-me-secret-key
+REGION=us-east-1
+ALLOWED_IPS=
+STORAGE_ROOT=./data
+LOG_FILE=activities.log
+```
+
+For Docker, keep `STORAGE_ROOT` and `LOG_FILE` as container paths:
+
+```dotenv
+DEBUG=false
+ACCESS_KEY=change-me-access-key
+SECRET_KEY=change-me-secret-key
+REGION=us-east-1
+ALLOWED_IPS=
+STORAGE_ROOT=/var/lib/tiny-s3
+LOG_FILE=/var/log/tiny-s3/activities.log
+```
+
+---
+
+## Run with Docker Compose
+
+This is the recommended deployment mode.
+
+```bash
+cp .env.template .env
+nano .env
+
+docker compose up -d --build
+```
+
+Default local endpoint:
+
+```text
+http://localhost:9000
+```
+
+The container exposes Nginx internally on port `8080`; Docker Compose maps it to local port `9000`.
+
+Check status:
+
+```bash
+docker compose ps
+docker logs -f tiny-s3
+curl http://localhost:9000/healthz
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
+Stop and remove the named volumes:
+
+```bash
+docker compose down -v
+```
+
+---
+
+## Storage Options
+
+### Option A — Docker named volumes
+
+This is the default in `docker-compose.yml`:
+
+```yaml
+volumes:
+  tiny_s3_data:
+  tiny_s3_logs:
+```
+
+Runtime paths inside the container:
+
+```text
+/var/lib/tiny-s3
+/var/log/tiny-s3
+```
+
+This is clean and portable, but files are managed by Docker.
+
+### Option B — Local folders
+
+Use the override file:
+
+```bash
+mkdir -p data logs
+docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d --build
+```
+
+This maps:
+
+```text
+./data -> /var/lib/tiny-s3
+./logs -> /var/log/tiny-s3
+```
+
+This is easier to backup manually from the VPS filesystem.
+
+---
+
+## Run with Docker Only
+
+Build:
+
+```bash
+docker build -t tiny-s3:local .
+```
+
+Run using local folders:
+
+```bash
+mkdir -p data logs
+
+docker run -d \
+  --name tiny-s3 \
+  --restart unless-stopped \
+  --env-file .env \
+  -e STORAGE_ROOT=/var/lib/tiny-s3 \
+  -e LOG_FILE=/var/log/tiny-s3/activities.log \
+  -p 9000:8080 \
+  -v "$PWD/data:/var/lib/tiny-s3" \
+  -v "$PWD/logs:/var/log/tiny-s3" \
+  tiny-s3:local
+```
+
+Healthcheck:
+
+```bash
+curl http://localhost:9000/healthz
+```
+
+Remove:
+
+```bash
+docker rm -f tiny-s3
+```
+
+---
+
+## Publish to Docker Hub
+
+Choose your Docker Hub namespace and image name. Example:
+
+```bash
+export DOCKERHUB_USER=your-dockerhub-user
+export IMAGE_NAME=tiny-s3
+export IMAGE_TAG=1.0.0
+```
+
+Login:
+
+```bash
+docker login
+```
+
+Build and tag:
+
+```bash
+docker build -t "$DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG" .
+docker tag "$DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG" "$DOCKERHUB_USER/$IMAGE_NAME:latest"
+```
+
+Push:
+
+```bash
+docker push "$DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG"
+docker push "$DOCKERHUB_USER/$IMAGE_NAME:latest"
+```
+
+Run the published image:
+
+```bash
+docker run -d \
+  --name tiny-s3 \
+  --restart unless-stopped \
+  --env-file .env \
+  -p 9000:8080 \
+  -v tiny_s3_data:/var/lib/tiny-s3 \
+  -v tiny_s3_logs:/var/log/tiny-s3 \
+  "$DOCKERHUB_USER/$IMAGE_NAME:latest"
+```
+
+### Multi-architecture build
+
+For `linux/amd64` and `linux/arm64`:
+
+```bash
+docker buildx create --use --name tiny-s3-builder || docker buildx use tiny-s3-builder
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t "$DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG" \
+  -t "$DOCKERHUB_USER/$IMAGE_NAME:latest" \
+  --push \
+  .
+```
+
+---
+
+## Production with Nginx Reverse Proxy
+
+When the container runs locally on the VPS and Nginx handles HTTPS, keep the container bound to localhost:
+
+```yaml
+ports:
+  - "127.0.0.1:9000:8080"
+```
+
+Example Nginx site for `api.storage.flisol.app`:
+
+```nginx
+server {
+    listen 80;
+    server_name api.storage.flisol.app;
+
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass http://127.0.0.1:9000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Authorization $http_authorization;
+
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+After enabling HTTPS with Certbot, use your normal certificate workflow, for example:
+
+```bash
+sudo certbot --nginx -d api.storage.flisol.app
+```
+
+---
+
+## VPS Installation without Docker — Nginx + PHP-FPM
+
+Install packages:
+
+```bash
+sudo apt update
+sudo apt install nginx php8.5-fpm php8.5-cli
+```
+
+Create directories:
+
+```bash
+sudo mkdir -p /var/www/tiny-s3 /var/lib/tiny-s3 /var/log/tiny-s3
+sudo cp index.php .env.template /var/www/tiny-s3/
+sudo cp .env.template /var/www/tiny-s3/.env
+sudo nano /var/www/tiny-s3/.env
+```
+
+Recommended `.env` for Nginx/FPM:
+
+```dotenv
+DEBUG=false
+ACCESS_KEY=change-me-access-key
+SECRET_KEY=change-me-secret-key
+REGION=us-east-1
+ALLOWED_IPS=
+STORAGE_ROOT=/var/lib/tiny-s3
+LOG_FILE=/var/log/tiny-s3/activities.log
+```
+
+Permissions:
+
+```bash
+sudo chown -R www-data:www-data /var/www/tiny-s3 /var/lib/tiny-s3 /var/log/tiny-s3
+```
+
+Nginx server block:
+
+```nginx
+server {
+    listen 80;
+    server_name api.storage.flisol.app;
+
+    root /var/www/tiny-s3;
+    index index.php;
+
+    client_max_body_size 0;
+
+    location / {
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.5-fpm.sock;
+        fastcgi_param HTTP_AUTHORIZATION $http_authorization;
+        fastcgi_request_buffering off;
+        fastcgi_buffering off;
+        fastcgi_read_timeout 3600s;
+    }
+}
+```
+
+Enable:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/tiny-s3 /etc/nginx/sites-enabled/tiny-s3
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+---
+
+## VPS Installation without Docker — Apache
+
+Apache is not the preferred container runtime here, but it is important for simple VPS/shared-hosting deployment.
+
+Install packages:
+
+```bash
+sudo apt update
+sudo apt install apache2 php8.5 libapache2-mod-php8.5
+sudo a2enmod rewrite headers
+```
+
+Copy files:
+
+```bash
+sudo mkdir -p /var/www/tiny-s3 /var/lib/tiny-s3 /var/log/tiny-s3
+sudo cp index.php .env.template .htaccess /var/www/tiny-s3/
+sudo cp .env.template /var/www/tiny-s3/.env
+sudo nano /var/www/tiny-s3/.env
+sudo chown -R www-data:www-data /var/www/tiny-s3 /var/lib/tiny-s3 /var/log/tiny-s3
+```
+
+Apache virtual host:
+
+```apacheconf
+<VirtualHost *:80>
+    ServerName api.storage.flisol.app
+    DocumentRoot /var/www/tiny-s3
+
+    <Directory /var/www/tiny-s3>
+        AllowOverride All
+        Require all granted
+        Options -Indexes
+    </Directory>
+
+    LimitRequestBody 0
+    ErrorLog ${APACHE_LOG_DIR}/tiny-s3-error.log
+    CustomLog ${APACHE_LOG_DIR}/tiny-s3-access.log combined
+</VirtualHost>
+```
+
+Enable:
+
+```bash
+sudo a2ensite tiny-s3.conf
+sudo apachectl configtest
+sudo systemctl reload apache2
+```
+
+The included `.htaccess` routes all requests to `index.php` and forwards the `Authorization` header to PHP. This is required because S3 clients sign requests using that header.
 
 ---
 
@@ -199,366 +561,181 @@ See `.env.template` for full documentation of every variable.
 
 ### AWS CLI
 
+Configure credentials:
+
+```bash
+export AWS_ACCESS_KEY_ID=change-me-access-key
+export AWS_SECRET_ACCESS_KEY=change-me-secret-key
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+Create a bucket:
+
 ```bash
 aws s3 mb s3://my-bucket \
-  --endpoint-url http://localhost:9000 \
-  --no-verify-ssl
+  --endpoint-url http://localhost:9000
+```
 
+Upload:
+
+```bash
 aws s3 cp file.txt s3://my-bucket/file.txt \
   --endpoint-url http://localhost:9000
 ```
 
-Set credentials in `~/.aws/credentials` or via environment variables:
+List:
 
 ```bash
-export AWS_ACCESS_KEY_ID=your-access-key-here
-export AWS_SECRET_ACCESS_KEY=your-secret-key-here
-export AWS_DEFAULT_REGION=us-east-1
+aws s3 ls s3://my-bucket \
+  --endpoint-url http://localhost:9000
 ```
 
-### Python (boto3)
+Download:
+
+```bash
+aws s3 cp s3://my-bucket/file.txt ./downloaded-file.txt \
+  --endpoint-url http://localhost:9000
+```
+
+Delete:
+
+```bash
+aws s3 rm s3://my-bucket/file.txt \
+  --endpoint-url http://localhost:9000
+```
+
+For production HTTPS:
+
+```bash
+aws s3 ls s3://my-bucket \
+  --endpoint-url https://api.storage.flisol.app
+```
+
+### boto3
 
 ```python
 import boto3
 
 s3 = boto3.client(
-    's3',
-    endpoint_url='http://localhost:9000',
-    aws_access_key_id='your-access-key-here',
-    aws_secret_access_key='your-secret-key-here',
-    region_name='us-east-1',
+    "s3",
+    endpoint_url="http://localhost:9000",
+    aws_access_key_id="change-me-access-key",
+    aws_secret_access_key="change-me-secret-key",
+    region_name="us-east-1",
 )
 
-s3.create_bucket(Bucket='my-bucket')
-s3.upload_file('file.txt', 'my-bucket', 'file.txt')
+s3.create_bucket(Bucket="my-bucket")
+s3.upload_file("file.txt", "my-bucket", "file.txt")
+print(s3.list_objects_v2(Bucket="my-bucket"))
 ```
 
 ### rclone
 
 ```ini
-# ~/.config/rclone/rclone.conf
 [tinys3]
 type = s3
 provider = Other
-access_key_id = your-access-key-here
-secret_access_key = your-secret-key-here
+access_key_id = change-me-access-key
+secret_access_key = change-me-secret-key
 region = us-east-1
 endpoint = http://localhost:9000
 ```
 
 ```bash
-rclone ls tinys3:my-bucket
+rclone mkdir tinys3:my-bucket
 rclone copy file.txt tinys3:my-bucket/
+rclone ls tinys3:my-bucket
 ```
-
----
-
-## Testing
-
-There are two complementary ways to test Tiny S3.
-
-### PHPUnit (automated, CI-friendly)
-
-A full PHPUnit suite lives in `tests/`. It requires PHP 8.1+, [Composer](https://getcomposer.org),
-and nothing else — the integration suite starts its own PHP built-in server automatically.
-
-```bash
-# Install dependencies (first time only)
-composer install
-
-# Run the full suite
-composer test
-
-# Run only the fast unit tests (no server required)
-composer test:unit
-
-# Run only the integration tests
-composer test:integration
-```
-
-**Suite structure**
-
-```
-tests/
-├── bootstrap.php               # Autoloader + loads index.php in test-safe mode
-├── helpers.php                 # Reference copy of pure functions (kept for documentation)
-├── Unit/
-│   ├── EnvTest.php             # loadEnv(), envToBool()
-│   ├── XmlTest.php             # xmlElement()
-│   ├── AuthParserTest.php      # parseAuthorization()
-│   ├── SigningKeyTest.php      # getSigningKey() — AWS test vectors
-│   └── FileSystemTest.php      # listObjectsRecursively(), deleteDirectoryRecursive()
-└── Integration/
-    ├── SigV4Signer.php         # PHP port of the HMAC signing chain
-    └── S3ServerTest.php        # 17 HTTP tests via Guzzle against a live server
-```
-
-Both suites exit with code `0` on full pass and `1` on any failure.
-
----
-
-### Bash / PowerShell validators
-
-Quick smoke-tests that need only a running server — no Composer, no PHPUnit. Both
-implement AWS Signature V4 signing from scratch and run the same 7-step sequence:
-create bucket → upload → head → list → download & verify → delete object → delete bucket.
-
-#### Bash (Linux / macOS)
-
-Requires `bash`, `curl`, and `openssl`.
-
-```bash
-chmod +x test.sh
-./test.sh
-
-# Override any value inline
-ENDPOINT=http://192.168.1.10:9000 ACCESS_KEY=mykey SECRET_KEY=mysecret ./test.sh
-```
-
-#### PowerShell (Windows / cross-platform)
-
-Requires PowerShell 5.1+ (Windows) or PowerShell 7+ (cross-platform).  
-Uses only built-in `System.Security.Cryptography` — no extra modules needed.
-
-```powershell
-.\test.ps1
-.\test.ps1 -Endpoint http://192.168.1.10:9000 -AccessKey mykey -SecretKey mysecret
-```
-
----
-
-## Code Coverage
-
-Coverage reports are generated by `composer coverage` and written to the `coverage/` directory:
-
-| File | Format | Use |
-|------|--------|-----|
-| `coverage/html/index.html` | Interactive HTML | Open in browser — line-by-line detail |
-| `coverage/clover.xml` | Clover XML | Jenkins Clover PHP plugin |
-| `coverage/cobertura.xml` | Cobertura XML | Jenkins Cobertura plugin |
-| `coverage/coverage.txt` | Plain text | Build log / artefact |
-
-PHPUnit delegates all coverage instrumentation to a PHP extension. There is no built-in
-option — you must have **one** of the following active before running `composer coverage`.
-
----
-
-### Windows
-
-#### Option A — Xdebug (recommended)
-
-**1. Download the right DLL**
-
-Go to **[xdebug.org/wizard](https://xdebug.org/wizard)**, paste the output of `php -i`,
-and click **Analyse**. The wizard shows the exact filename and download link, for example:
-`php_xdebug-3.4.2-8.3-vs16-x86_64.dll`.
-
-**2. Find your extension directory**
-
-```powershell
-php -i | Select-String "extension_dir"
-# e.g. C:\tools\php83\ext
-```
-
-Copy the downloaded `.dll` into that folder.
-
-**3. Find and edit `php.ini`**
-
-```powershell
-php --ini
-# e.g. C:\tools\php83\php.ini
-```
-
-Add at the bottom of `php.ini`:
-
-```ini
-zend_extension=xdebug
-xdebug.mode=coverage
-```
-
-**4. Verify**
-
-```powershell
-php -m | Select-String xdebug
-# should print: xdebug
-```
-
-Then run:
-
-```powershell
-composer coverage
-```
-
-#### Option B — PCOV (if available in your PHP distribution)
-
-Some PHP bundles on Windows include PCOV. Check:
-
-```powershell
-php -m | Select-String pcov
-```
-
-If it prints `pcov`, just run `composer coverage` — no configuration needed.  
-If it prints nothing, use Xdebug (Option A above).
-
----
-
-### macOS
-
-#### Option A — Homebrew PHP (recommended)
-
-```bash
-# Install Xdebug via PECL
-pecl install xdebug
-
-# Find php.ini
-php --ini
-
-# Add to php.ini:
-# zend_extension=xdebug
-# xdebug.mode=coverage
-```
-
-Or with **Laravel Herd** / **Valet**:
-
-1. Open **Herd → Settings → PHP → Extensions**
-2. Enable **Xdebug** or **PCOV**
-3. Click Restart PHP
-
-Then run:
-
-```bash
-XDEBUG_MODE=coverage composer coverage
-# or if PCOV is enabled:
-composer coverage
-```
-
-#### Option B — Homebrew PCOV (faster, lower overhead)
-
-```bash
-pecl install pcov
-# add to php.ini: extension=pcov
-composer coverage
-```
-
----
-
-### Linux
-
-#### Option A — Xdebug via package manager
-
-**Ubuntu / Debian:**
-```bash
-sudo apt install php-xdebug
-
-# Add to /etc/php/8.x/cli/php.ini (or conf.d/20-xdebug.ini):
-# xdebug.mode=coverage
-```
-
-**Fedora / RHEL:**
-```bash
-sudo dnf install php-xdebug
-# xdebug.mode=coverage  →  /etc/php.d/15-xdebug.ini
-```
-
-**Alpine (Docker):**
-```dockerfile
-RUN apk add --no-cache php-xdebug \
- && echo "xdebug.mode=coverage" >> /etc/php83/conf.d/50_xdebug.ini
-```
-
-Then run:
-
-```bash
-XDEBUG_MODE=coverage composer coverage
-```
-
-#### Option B — PCOV via PECL (faster, coverage-only)
-
-```bash
-pecl install pcov
-
-# Add to php.ini:
-# extension=pcov
-
-composer coverage
-```
-
-#### Option C — Docker one-liner (no local install)
-
-```bash
-docker run --rm \
-  -v "$(pwd)":/app -w /app \
-  -e XDEBUG_MODE=coverage \
-  php:8.3-cli sh -c "pecl install xdebug && composer coverage"
-```
-
----
-
-### CI / Jenkins
-
-The `Jenkinsfile` at the project root configures a full pipeline. It uses
-`XDEBUG_MODE=coverage` on the agent and publishes three report types:
-
-- **HTML Publisher** → interactive `coverage/html/` report linked from the build page
-- **Cobertura** → line/branch/method trend chart on the project page
-- **JUnit** → test pass/fail trend
-
-Required Jenkins plugins: **HTML Publisher**, **Cobertura**, **JUnit**.
-
----
-
-## Security Notes
-
-- **IP allowlist** — set `ALLOWED_IPS` in `.env` to restrict access to known IPs or CIDR ranges. The check runs before signature verification, so blocked clients never touch the crypto layer. Supports exact IPv4/IPv6 addresses and CIDR blocks; multiple entries are comma- or space-separated. Leave empty (or set to `*`) to disable. **Loopback addresses (`127.x.x.x`, `::1`) are always allowed automatically** — they can only come from the same server, so a co-hosted Laravel app does not need special configuration.
-- **Path traversal protection** — GET and DELETE resolve the object key with `realpath()` and verify the result stays inside the bucket directory. PUT validates the key's components before any file is created, rejecting keys containing `..` segments. HEAD uses the same `realpath()` bounds check as GET/DELETE.
-- **Timing-safe comparison** — signatures are compared with `hash_equals()` to prevent timing attacks.
-- **DEBUG mode** — logs full Authorization headers and signature internals. Always set `DEBUG = false` in production.
-- **HTTPS** — use a reverse proxy (Nginx, Caddy) with TLS in production. The built-in PHP server is plaintext only.
-- **Directory permissions** — `STORAGE_ROOT` should not be web-accessible. Place it outside the document root.
 
 ---
 
 ## Diagnostics
 
-When logging is not working (common on shared hosting where the web root is not writable by PHP), use the built-in diagnostic endpoint to inspect the server's resolved configuration without SSH access.
+Health endpoint:
 
-```
-GET https://your-tiny-s3-host/__diag?token=YOUR_SECRET_KEY
-```
-
-The token is your `SECRET_KEY` value — only someone who already knows it can read the report. The response is plain text and includes:
-
-- PHP version and SAPI
-- `REMOTE_ADDR` as seen by Tiny S3 (useful for diagnosing IP allowlist issues)
-- Resolved absolute paths for `STORAGE_ROOT` and `LOG_FILE`, with existence and write-permission checks
-- The `sys_get_temp_dir()` fallback path if the configured log file is unwritable
-- A live write test to `LOG_FILE`
-
-**Shared hosting log file tip:** if the report shows `LOG_FILE` as `NOT WRITABLE`, add an absolute path to your `.env`:
-
-```dotenv
-LOG_FILE = /home/yourusername/logs/tiny-s3.log
+```bash
+curl http://localhost:9000/healthz
 ```
 
-Tiny S3 automatically falls back to `sys_get_temp_dir()` if the configured path is unwritable, so logging always works even before the path is corrected. The fallback path is shown in the `/__diag` report and in the web-server error log.
+Diagnostic endpoint:
+
+```bash
+curl "http://localhost:9000/__diag?token=change-me-secret-key"
+```
+
+The diagnostic endpoint requires the `SECRET_KEY` as token and shows PHP version, resolved paths, and write checks. Do not expose the secret key.
 
 ---
 
-## What Is Not Implemented
+## Testing
 
-This is intentionally minimal. The following S3 features are **not** supported:
+Install dev dependencies:
 
-- Multipart uploads (`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`)
-- Object versioning
-- Pre-signed URLs
-- ACLs and bucket policies
-- Server-side encryption
-- Object metadata (`x-amz-meta-*` headers)
-- Pagination for bucket listings (`max-keys`, `prefix`, `marker`)
-- Bucket location / region API endpoints
+```bash
+composer install
+```
+
+Run all tests:
+
+```bash
+composer test
+```
+
+Run unit tests:
+
+```bash
+composer test:unit
+```
+
+Run integration tests:
+
+```bash
+composer test:integration
+```
+
+The test suite uses PHPUnit and Guzzle only for development/testing. The runtime server itself does not need Composer packages.
+
+---
+
+## Security Notes
+
+- Use HTTPS in production.
+- Keep `DEBUG=false` in production because debug logs can contain sensitive signature data.
+- Use long random `ACCESS_KEY` and `SECRET_KEY` values.
+- Restrict access with `ALLOWED_IPS` when the client IP range is known.
+- Put `STORAGE_ROOT` outside the public document root in VPS installs.
+- Backup the storage directory regularly.
+- Do not commit `.env`.
+- Use reverse proxy upload streaming settings for large files.
+
+---
+
+## Backup
+
+For Docker named volume:
+
+```bash
+docker run --rm \
+  -v tiny_s3_data:/data \
+  -v "$PWD":/backup \
+  alpine tar czf /backup/tiny-s3-data-backup.tar.gz -C /data .
+```
+
+For bind-mounted local folder:
+
+```bash
+tar czf tiny-s3-data-backup.tar.gz ./data
+```
+
+Restore to a bind-mounted folder:
+
+```bash
+mkdir -p data
+tar xzf tiny-s3-data-backup.tar.gz -C ./data
+```
 
 ---
 
 ## License
 
-MIT — Copyright © 2026 Francisco Ernesto Teixeira
+MIT.

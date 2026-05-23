@@ -1022,6 +1022,16 @@ foreach (getallheaders() as $name => $value) {
     writeLog('DEBUG', "Header: $name: $value");
 }
 
+// /healthz — Docker/Kubernetes-friendly health endpoint.
+// It is intentionally public and returns only a minimal status, with no secrets or paths.
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
+    && (parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) === '/healthz')
+) {
+    header('Content-Type: text/plain; charset=utf-8');
+    echo 'ok';
+    exit;
+}
+
 // /__diag — diagnostic endpoint (must come before IP allowlist + signature checks)
 // Responds to GET /__diag?token=<SECRET_KEY> with a plain-text report of every
 // resolved config value, path, and write-permission check.

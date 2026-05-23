@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+vendor
+data
+logs
+coverage
+.phpunit.result.cache
+.env
+*.log
+__MACOSX
+.DS_Store
+*.zip

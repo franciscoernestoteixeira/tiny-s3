@@ -1,0 +1,21 @@
+services:
+  tiny-s3:
+    build:
+      context: .
+    image: tiny-s3:local
+    container_name: tiny-s3
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STORAGE_ROOT: /var/lib/tiny-s3
+      LOG_FILE: /var/log/tiny-s3/activities.log
+    ports:
+      - "9000:8080"
+    volumes:
+      - tiny_s3_data:/var/lib/tiny-s3
+      - tiny_s3_logs:/var/log/tiny-s3
+
+volumes:
+  tiny_s3_data:
+  tiny_s3_logs:

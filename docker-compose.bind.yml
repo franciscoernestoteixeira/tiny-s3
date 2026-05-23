@@ -1,0 +1,5 @@
+services:
+  tiny-s3:
+    volumes:
+      - ./data:/var/lib/tiny-s3
+      - ./logs:/var/log/tiny-s3
