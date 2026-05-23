@@ -76,7 +76,7 @@ class FileSystemTest extends TestCase
         $keys = listObjectsRecursively($this->tempDir);
         sort($keys);
 
-        $this->assertSame(['2024/february.csv', '2024/january.csv'], $keys);
+        $this->assertSame(['2024/', '2024/february.csv', '2024/january.csv'], $keys);
     }
 
     public function testListObjectsRecursivelyHandlesDeeplyNestedPaths(): void
@@ -85,7 +85,7 @@ class FileSystemTest extends TestCase
         file_put_contents($this->tempDir . '/a/b/c/deep.txt', 'deep');
 
         $keys = listObjectsRecursively($this->tempDir);
-        $this->assertSame(['a/b/c/deep.txt'], $keys);
+        $this->assertSame(['a/', 'a/b/', 'a/b/c/', 'a/b/c/deep.txt'], $keys);
     }
 
     public function testListObjectsRecursivelyMixesFlatAndNestedFiles(): void
@@ -97,7 +97,7 @@ class FileSystemTest extends TestCase
         $keys = listObjectsRecursively($this->tempDir);
         sort($keys);
 
-        $this->assertSame(['root.txt', 'sub/child.txt'], $keys);
+        $this->assertSame(['root.txt', 'sub/', 'sub/child.txt'], $keys);
     }
 
     public function testListObjectsRecursivelyPrefixAddsTrailingSlash(): void
@@ -110,7 +110,9 @@ class FileSystemTest extends TestCase
 
         $keys = listObjectsRecursively($this->tempDir);
         $this->assertContains('photos/beach.jpg', $keys);
-        // The key must not contain a bare `photos` entry — directory names are not keys
+        // Physical directories are exposed as S3-style virtual directory prefixes.
+        $this->assertContains('photos/', $keys);
+        // The key must not contain a bare `photos` entry — directory prefixes end in `/`.
         $this->assertNotContains('photos', $keys);
     }
 

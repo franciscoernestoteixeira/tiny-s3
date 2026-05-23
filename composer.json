@@ -22,24 +22,28 @@
     "scripts": {
         "start":               "@php -S localhost:9000 index.php",
 
-        "test":                "phpunit",
+        "test":                "phpunit --no-coverage",
         "test:unit":           "phpunit --testsuite Unit",
         "test:integration":    "phpunit --testsuite Integration",
 
-        "coverage":            "phpunit --coverage-text=coverage/coverage.txt",
-        "coverage:unit":       "phpunit --testsuite Unit   --coverage-text=coverage/coverage.txt",
-        "coverage:integration":"phpunit --testsuite Integration --coverage-text=coverage/coverage.txt",
-        "coverage:ci":         "phpunit --log-junit coverage/junit.xml --coverage-text=coverage/coverage.txt"
+        "coverage":             "bin/coverage_text.sh",
+        "coverage:html":        "bin/coverage_html.sh",
+        "coverage:unit":        "phpunit --testsuite Unit --coverage-text=coverage/coverage.txt",
+        "coverage:integration": "phpunit --testsuite Integration --coverage-text=coverage/coverage.txt",
+        "coverage:ci":          "phpunit --log-junit coverage/junit.xml --coverage-text=coverage/coverage.txt"
     },
     "scripts-descriptions": {
         "start":               "Start the built-in PHP development server on :9000",
+
         "test":                "Run the full test suite (no coverage)",
         "test:unit":           "Run only the Unit testsuite (fast, no server)",
         "test:integration":    "Run only the Integration testsuite (starts a real PHP server)",
-        "coverage":            "Run full suite WITH coverage — requires Xdebug (XDEBUG_MODE=coverage) or PCOV",
-        "coverage:unit":       "Coverage for Unit tests only",
-        "coverage:integration":"Coverage for Integration tests only",
-        "coverage:ci":         "CI mode: coverage reports + JUnit XML in coverage/"
+
+        "coverage":             "Run full suite with text coverage using Herd when available, otherwise standard Xdebug/PCOV",
+        "coverage:html":        "Generate HTML coverage report using Herd when available, otherwise standard Xdebug/PCOV",
+        "coverage:unit":        "Coverage for Unit tests only",
+        "coverage:integration": "Coverage for Integration tests only",
+        "coverage:ci":          "CI mode: coverage reports + JUnit XML in coverage/"
     },
     "config": {
         "process-timeout": 0
